@@ -7,6 +7,7 @@ __pycache__/
 temp_uploads/
 tasks.json
 user_registrations.json
+admin_requests.json
 
 dist/
 recovered_source/

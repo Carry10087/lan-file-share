@@ -206,6 +206,10 @@ FLASK_SESSION_COOKIE_NAME = 'lanfs_session'
 SECRET_KEY_FILE = os.path.join(BASE_PATH, '.flask_secret_key')
 ONLINE_PRESENCE_TTL_SECONDS = 45
 REALTIME_STREAM_INTERVAL_SECONDS = 2.0
+WAITRESS_THREADS = 24
+WAITRESS_CONNECTION_LIMIT = 512
+WAITRESS_CHANNEL_TIMEOUT = 300
+WAITRESS_CLEANUP_INTERVAL = 30
 PASSWORD_MIN_LENGTH = 6
 PASSWORD_HASH_ITERATIONS = 200000
 ACCOUNT_KEY_PREFIX = 'user:'
@@ -729,7 +733,6 @@ def login():
 
     session['username'] = username
     sync_current_online_presence()
-    add_activity(username, 'online', None)
     
     if redirect_mode:
         flash('登录成功。', 'success')
@@ -765,9 +768,6 @@ def check_registration():
 @app.route('/logout', methods=['POST'])
 def logout():
     """Log out the current session."""
-    username = normalize_username(session.get('username'))
-    if username:
-        add_activity(username, 'offline', None)
     session.pop('username', None)
     presence_id = get_page_session_id()
     with user_lock:
@@ -797,9 +797,7 @@ def user_offline():
     presence_id = get_page_session_id()
     with user_lock:
         if presence_id in online_users:
-            username = online_users[presence_id]['username']
             del online_users[presence_id]
-            add_activity(username, 'offline', None)
             return jsonify({'success': True, 'message': '已下线。'})
     return jsonify({'success': False, 'message': '未找到在线会话。'}), 404
 
@@ -1001,6 +999,19 @@ def add_activity(username, action, filename):
         if len(current_activities) > 100:
             current_activities.pop(0)
 
+def normalize_activity_action(action):
+    """只保留前端需要展示的标准动态类型。"""
+    value = str(action or '').strip()
+    lowered = value.lower()
+
+    if lowered == 'upload' or value == '上传':
+        return '上传'
+    if lowered == 'download' or value == '下载':
+        return '下载'
+    if lowered == 'delete' or value == '删除':
+        return '删除'
+    return None
+
 def get_online_users_snapshot():
     """Docstring."""
     with user_lock:
@@ -1019,8 +1030,17 @@ def get_online_users_snapshot():
 def get_recent_activities_snapshot(limit=10):
     """Docstring."""
     with activity_lock:
-        recent = current_activities[-limit:] if len(current_activities) > limit else current_activities[:]
-    return list(reversed(recent))
+        normalized_recent = []
+        for item in reversed(current_activities):
+            normalized_action = normalize_activity_action(item.get('action'))
+            if not normalized_action:
+                continue
+            normalized_item = dict(item)
+            normalized_item['action'] = normalized_action
+            normalized_recent.append(normalized_item)
+            if len(normalized_recent) >= limit:
+                break
+    return normalized_recent
 
 def get_active_tasks_snapshot():
     """Docstring."""
@@ -1327,6 +1347,7 @@ TEXT_REALTIME_HISTORY_LIMIT = 80
 TEXT_REALTIME_STREAM_HEARTBEAT = 15
 TEXT_REALTIME_STREAM_QUEUE_SIZE = 32
 TEXT_REALTIME_EDIT_DEBOUNCE_MS = 260
+BROWSE_PAGE_SIZE = 120
 
 excel_collaboration_lock = threading.Lock()
 excel_collaboration_state = {}
@@ -2467,6 +2488,102 @@ def is_previewable_file(filename):
         is_word_editable_file(filename) or
         is_excel_editable_file(filename)
     )
+
+def get_preview_mode_for_filename(filename):
+    """Return the preview mode identifier for a file in the browse list."""
+    if is_excel_editable_file(filename):
+        return 'excel'
+    if is_word_editable_file(filename):
+        return 'word'
+    if is_text_previewable_file(filename):
+        return 'text'
+    if is_previewable_file(filename):
+        return 'preview'
+    return ''
+
+def build_directory_entry_payload(entry, subpath=''):
+    """Build a serialized payload for a file/folder in a browse listing."""
+    item_name = entry.name
+    if should_hide_shared_item(item_name):
+        return None, 0
+
+    item_path = entry.path
+    if not os.access(item_path, os.R_OK):
+        return None, 0
+
+    stat = entry.stat(follow_symlinks=False)
+    mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    relative_path = os.path.join(subpath, item_name).replace('\\', '/') if subpath else item_name
+    is_folder = entry.is_dir(follow_symlinks=False)
+    size_bytes = 0 if is_folder else int(stat.st_size or 0)
+
+    payload = {
+        'name': item_name + '/' if is_folder else item_name,
+        'display_name': item_name,
+        'relative_path': relative_path,
+        'size': '文件夹' if is_folder else get_file_size(size_bytes),
+        'size_bytes': size_bytes,
+        'time': mtime,
+        'is_folder': is_folder,
+        'is_empty_folder': False,
+        'icon': '📁' if is_folder else get_file_icon(item_name),
+        'is_previewable': False if is_folder else is_previewable_file(item_name),
+        'preview_mode': '' if is_folder else get_preview_mode_for_filename(item_name)
+    }
+    return payload, size_bytes
+
+def get_directory_entries(current_path, subpath=''):
+    """Read and sort the direct children of the current directory."""
+    files = []
+    total_size = 0
+
+    if not os.path.exists(current_path):
+        return files, total_size
+
+    try:
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                try:
+                    payload, size_bytes = build_directory_entry_payload(entry, subpath)
+                    if not payload:
+                        continue
+                    files.append(payload)
+                    total_size += size_bytes
+                except (OSError, PermissionError) as e:
+                    print(f"⚠️  无法访问: {entry.path} - {e}")
+                    continue
+    except (OSError, PermissionError) as e:
+        print(f"⚠️  无法读取目录: {current_path} - {e}")
+        raise
+
+    files.sort(key=lambda item: (not item.get('is_folder', False), str(item.get('name', '')).lower()))
+    return files, total_size
+
+def calculate_directory_size_async(current_path):
+    """Calculate the recursive size of a directory without blocking first paint."""
+    total_size = 0
+    stack = [current_path]
+
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if should_hide_shared_item(name):
+                        continue
+                    try:
+                        if not os.access(entry.path, os.R_OK):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total_size += int(entry.stat(follow_symlinks=False).st_size or 0)
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            continue
+    return total_size
 
 def guess_inline_mimetype(filename):
     """为音视频内联预览推断更合适的 MIME 类型"""
@@ -4631,13 +4748,19 @@ HTML_TEMPLATE = """
         .file-actions {
             display: flex;
             gap: 10px;
-            opacity: 0.6;
-            transition: opacity 0.3s ease;
+            opacity: 1;
+            transition: none;
         }
         
         .file-item:hover .file-actions {
             opacity: 1;
         }
+
+        .file-actions .btn-download,
+        .file-actions .btn-delete {
+            transition: none;
+        }
+
         .btn-download {
             background: rgba(16, 185, 129, 0.15);
             backdrop-filter: blur(3px);
@@ -4660,6 +4783,11 @@ HTML_TEMPLATE = """
             background: rgba(16, 185, 129, 0.5);
             transform: translateY(-2px);
             box-shadow: 0 4px 16px rgba(16, 185, 129, 0.4);
+        }
+
+        .file-actions .btn-download:hover {
+            transform: none;
+            box-shadow: 0 2px 8px rgba(16, 185, 129, 0.2);
         }
         
         .btn-download:active {
@@ -4688,6 +4816,11 @@ HTML_TEMPLATE = """
             background: rgba(244, 63, 94, 0.5);
             transform: translateY(-2px);
             box-shadow: 0 4px 16px rgba(244, 63, 94, 0.4);
+        }
+
+        .file-actions .btn-delete:hover {
+            transform: none;
+            box-shadow: 0 2px 8px rgba(244, 63, 94, 0.2);
         }
         
         .btn-delete:active {
@@ -5335,7 +5468,7 @@ HTML_TEMPLATE = """
             z-index: 1;
         }
         
-        @keyframes pulse {
+        @keyframes activityDotPulse {
             0% {
                 opacity: 0.3;
                 transform: scale(0.8);
@@ -5369,6 +5502,10 @@ HTML_TEMPLATE = """
             border: 1px solid rgba(255, 255, 255, 0.2);
             position: relative;
             z-index: 1;
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            overflow: hidden;
         }
         
         .user-item strong {
@@ -5380,7 +5517,93 @@ HTML_TEMPLATE = """
             font-size: 12px;
             line-height: 1.5;
         }
-        
+
+        .activity-item.activity-upload {
+            background: rgba(16, 185, 129, 0.16);
+            border-color: rgba(16, 185, 129, 0.35);
+        }
+
+        .activity-item.activity-download {
+            background: rgba(59, 130, 246, 0.16);
+            border-color: rgba(96, 165, 250, 0.35);
+        }
+
+        .activity-item.activity-delete {
+            background: rgba(239, 68, 68, 0.16);
+            border-color: rgba(248, 113, 113, 0.35);
+        }
+
+        .activity-item.active-task {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            padding: 12px;
+        }
+
+        .activity-task-title {
+            margin-bottom: 4px;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .activity-task-file {
+            display: block;
+            width: 100%;
+            font-size: 12px;
+            color: rgba(255,255,255,0.9);
+            word-break: break-all;
+            overflow-wrap: anywhere;
+        }
+
+        .activity-task-progress {
+            margin-top: 8px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .activity-task-progress-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 4px;
+            width: 100%;
+            box-sizing: border-box;
+            font-size: 11px;
+            color: rgba(255,255,255,0.8);
+        }
+
+        .activity-task-progress-row span {
+            min-width: 0;
+        }
+
+        .activity-task-progress-row .progress-label {
+            flex: 1 1 auto;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .activity-task-progress-row .progress-value {
+            flex: 0 0 auto;
+            text-align: right;
+        }
+
+        .activity-task-progress-bar {
+            width: 100%;
+            height: 6px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 3px;
+            overflow: hidden;
+            box-sizing: border-box;
+        }
+
+        .activity-task-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #059669);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+            max-width: 100%;
+        }
+
         .activity-time {
             color: rgba(255, 255, 255, 0.7);
             font-size: 11px;
@@ -5388,10 +5611,10 @@ HTML_TEMPLATE = """
         }
         
         .active-task {
-            animation: pulse 2s ease-in-out infinite;
+            animation: activeTaskPulse 2s ease-in-out infinite;
         }
-        
-        @keyframes pulse {
+
+        @keyframes activeTaskPulse {
             0%, 100% {
                 box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4);
             }
@@ -5523,10 +5746,10 @@ HTML_TEMPLATE = """
             display: none;
             backdrop-filter: blur(10px);
             border: 3px solid rgba(255, 255, 255, 0.3);
-            animation: pulse 1s infinite;
+            animation: dragHintPulse 1s infinite;
         }
-        
-        @keyframes pulse {
+
+        @keyframes dragHintPulse {
             0%, 100% { transform: translate(-50%, -50%) scale(1); }
             50% { transform: translate(-50%, -50%) scale(1.05); }
         }
@@ -5952,7 +6175,7 @@ HTML_TEMPLATE = """
                 <div class="notification-message">
                     您有以下文件上传未完成，可以继续上传：<br>
                     <small style="color: rgba(255, 255, 255, 0.7); margin-top: 5px; display: block;">
-                        由于浏览器安全限制，需要重新选择文件后才能继续上传，系统会自动从断点恢复。
+                        系统会优先尝试从浏览器本地缓存自动恢复；如果缓存不可用，才需要重新选择文件并从断点继续上传。
                     </small>
                 </div>
                 <div class="incomplete-tasks-list" id="incompleteTasksList"></div>
@@ -5985,11 +6208,14 @@ HTML_TEMPLATE = """
             <div class="stats">
                 <div class="stat-item">
                     <div class="stat-label">文件总数</div>
-                    <div class="stat-value">{{ files|length }}</div>
+                    <div class="stat-value">{{ files_total_count }}</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">总大小</div>
-                    <div class="stat-value">{{ total_size }}</div>
+                    <div class="stat-value" id="totalSizeValue">{{ total_size }}</div>
+                    <div id="totalSizeHint" style="margin-top: 8px; font-size: 12px; color: rgba(255,255,255,0.75);">
+                        当前目录文件大小 {{ current_folder_size }}，完整统计稍后加载
+                    </div>
                 </div>
             </div>
         </div>
@@ -6146,7 +6372,7 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             
-            {% if files %}
+            {% if files_total_count %}
                 <!-- 全选控制 -->
                 <div style="margin-bottom: 10px; padding: 10px 15px; background: rgba(255, 255, 255, 0.05); border-radius: 8px;">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: rgba(255, 255, 255, 0.9);">
@@ -6155,7 +6381,7 @@ HTML_TEMPLATE = """
                     </label>
                 </div>
                 
-                <ul class="file-list">
+                <ul class="file-list" id="fileList">
                     {% for file in files %}
                         {% if file.is_folder %}
                             {# 文件夹，可点击进入 #}
@@ -6180,7 +6406,8 @@ HTML_TEMPLATE = """
                                         <img src="/static/钢笔.png" style="width: 25px; height: 25px; vertical-align: middle; margin-right: 4px;">重命名
                                     </button>
                                     <a href="{{ url_for('download_folder', folder_name=folder_path) }}" 
-                                       class="btn-download" 
+                                       class="btn-download btn-folder-download"
+                                       data-folder-download="1"
                                        onclick="event.stopPropagation()">
                                         <img src="/static/下载.png" style="width: 25px; height: 25px; vertical-align: middle; margin-right: 4px;">下载
                                     </a>
@@ -6238,6 +6465,18 @@ HTML_TEMPLATE = """
                         {% endif %}
                     {% endfor %}
                 </ul>
+                <div id="browseLoadState" style="display: flex; justify-content: center; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap;">
+                    <span id="browseLoadedText" style="color: rgba(255,255,255,0.82); font-size: 13px;">
+                        已加载 {{ initial_loaded_count }} / {{ files_total_count }} 项
+                    </span>
+                    <button id="loadMoreBtn"
+                            type="button"
+                            onclick="loadMoreFiles()"
+                            style="display: {% if files_total_count > initial_loaded_count %}inline-flex{% else %}none{% endif %}; padding: 10px 18px; border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.08); color: white; border-radius: 10px; cursor: pointer; align-items: center; gap: 8px;">
+                        加载更多
+                    </button>
+                </div>
+                <div id="browseLoadSentinel" style="height: 1px;"></div>
             {% else %}
                 <div class="empty-message">
                     <span class="emoji">...</span>
@@ -6338,10 +6577,12 @@ HTML_TEMPLATE = """
         // ========== 任务管理变量（提前定义） ==========
         let activeTasks = {}; // {task_id: {xhr, file, ...}}
         let localRealtimeUploads = {}; // {task_id: {filename, progress, status, ...}}
+        let uploadFileCacheDbPromise = null;
         let currentSessionUsername = {{ (session.get('username') or '') | tojson }};
         const passwordMinLength = {{ password_min_length | int }};
         const nicknameMaxLength = {{ nickname_max_length | int }};
         const nicknamePattern = /^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{1,4}$/;
+        const chunkUploadSizeBytes = 10 * 1024 * 1024;
         const sessionLoggedIn = {{ 'true' if session.get('username') else 'false' }};
         const pageSessionId = (() => {
             try {
@@ -6390,6 +6631,241 @@ HTML_TEMPLATE = """
             return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         }
 
+        const uploadBatchStates = {};
+
+        function createUploadBatch(totalItems) {
+            const normalizedTotal = Math.max(1, Number(totalItems) || 1);
+            const batchId = `upload-batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+            uploadBatchStates[batchId] = {
+                pending: normalizedTotal,
+                failed: 0,
+                shouldReload: false
+            };
+            return batchId;
+        }
+
+        function finishUploadBatchItem(batchId, options = {}) {
+            const failed = !!options.failed;
+            const shouldReload = options.shouldReload !== false;
+            const state = batchId ? uploadBatchStates[batchId] : null;
+
+            if (!state) {
+                if (!failed && shouldReload) {
+                    setTimeout(() => window.location.reload(), 500);
+                } else {
+                    updateTasksList();
+                    updateActivities();
+                }
+                return;
+            }
+
+            state.pending = Math.max(0, state.pending - 1);
+            if (failed) {
+                state.failed += 1;
+            } else if (shouldReload) {
+                state.shouldReload = true;
+            }
+
+            if (state.pending > 0) {
+                return;
+            }
+
+            delete uploadBatchStates[batchId];
+
+            if (state.shouldReload && state.failed === 0) {
+                setTimeout(() => window.location.reload(), 500);
+            } else {
+                updateTasksList();
+                updateActivities();
+            }
+        }
+
+        function openUploadFileCacheDb() {
+            if (!('indexedDB' in window)) {
+                return Promise.resolve(null);
+            }
+            if (uploadFileCacheDbPromise) {
+                return uploadFileCacheDbPromise;
+            }
+            uploadFileCacheDbPromise = new Promise((resolve) => {
+                try {
+                    const request = indexedDB.open('lanfs-upload-cache', 1);
+                    request.onupgradeneeded = function() {
+                        const db = request.result;
+                        if (!db.objectStoreNames.contains('files')) {
+                            db.createObjectStore('files');
+                        }
+                    };
+                    request.onsuccess = function() {
+                        resolve(request.result);
+                    };
+                    request.onerror = function() {
+                        console.warn('上传缓存数据库初始化失败:', request.error);
+                        resolve(null);
+                    };
+                } catch (error) {
+                    console.warn('上传缓存数据库不可用:', error);
+                    resolve(null);
+                }
+            });
+            return uploadFileCacheDbPromise;
+        }
+
+        async function cacheUploadFileForResume(taskId, file) {
+            if (!taskId || !file) {
+                return false;
+            }
+            const db = await openUploadFileCacheDb();
+            if (!db) {
+                return false;
+            }
+            return new Promise((resolve) => {
+                try {
+                    const transaction = db.transaction('files', 'readwrite');
+                    transaction.objectStore('files').put({
+                        file: file,
+                        filename: file.name,
+                        size: file.size,
+                        type: file.type || '',
+                        updatedAt: Date.now()
+                    }, String(taskId));
+                    transaction.oncomplete = function() {
+                        resolve(true);
+                    };
+                    transaction.onerror = function() {
+                        console.warn('上传文件缓存失败:', transaction.error);
+                        resolve(false);
+                    };
+                } catch (error) {
+                    console.warn('写入上传缓存失败:', error);
+                    resolve(false);
+                }
+            });
+        }
+
+        async function getCachedUploadFileEntry(taskId) {
+            if (!taskId) {
+                return null;
+            }
+            const db = await openUploadFileCacheDb();
+            if (!db) {
+                return null;
+            }
+            return new Promise((resolve) => {
+                try {
+                    const transaction = db.transaction('files', 'readonly');
+                    const request = transaction.objectStore('files').get(String(taskId));
+                    request.onsuccess = function() {
+                        resolve(request.result || null);
+                    };
+                    request.onerror = function() {
+                        console.warn('读取上传缓存失败:', request.error);
+                        resolve(null);
+                    };
+                } catch (error) {
+                    console.warn('打开上传缓存失败:', error);
+                    resolve(null);
+                }
+            });
+        }
+
+        async function getCachedUploadFileForResume(taskId, serverTask = null) {
+            const entry = await getCachedUploadFileEntry(taskId);
+            if (!entry || !entry.file) {
+                return null;
+            }
+
+            const filename = entry.filename || (serverTask && serverTask.filename) || 'resume-upload.bin';
+            const file = entry.file instanceof File
+                ? entry.file
+                : new File([entry.file], filename, { type: entry.type || '' });
+
+            if (serverTask && serverTask.filename && file.name !== serverTask.filename) {
+                console.warn('缓存文件名与任务不一致，忽略缓存:', file.name, serverTask.filename);
+                return null;
+            }
+
+            if (serverTask && Number(serverTask.total_chunks || 0) > 0) {
+                const actualChunks = Math.ceil(file.size / chunkUploadSizeBytes);
+                if (actualChunks !== Number(serverTask.total_chunks || 0)) {
+                    console.warn('缓存文件大小与任务不一致，忽略缓存:', actualChunks, serverTask.total_chunks);
+                    return null;
+                }
+            }
+
+            return file;
+        }
+
+        async function removeCachedUploadFile(taskId) {
+            if (!taskId) {
+                return false;
+            }
+            const db = await openUploadFileCacheDb();
+            if (!db) {
+                return false;
+            }
+            return new Promise((resolve) => {
+                try {
+                    const transaction = db.transaction('files', 'readwrite');
+                    transaction.objectStore('files').delete(String(taskId));
+                    transaction.oncomplete = function() {
+                        resolve(true);
+                    };
+                    transaction.onerror = function() {
+                        resolve(false);
+                    };
+                } catch (error) {
+                    console.warn('删除上传缓存失败:', error);
+                    resolve(false);
+                }
+            });
+        }
+
+        function buildUploadTaskState(taskId, file, serverTask, uploadPathOverride = null) {
+            const expectedChunks = Number(serverTask && serverTask.total_chunks || 0);
+            const totalChunks = expectedChunks || Math.ceil(file.size / chunkUploadSizeBytes);
+            const uploadedChunks = Number(serverTask && serverTask.uploaded_chunks || 0);
+            const lockedUploadPath = uploadPathOverride !== null && uploadPathOverride !== undefined
+                ? String(uploadPathOverride)
+                : String((serverTask && serverTask.upload_path) || '');
+
+            return {
+                type: 'upload',
+                file: file,
+                totalChunks: totalChunks,
+                uploadedChunks: uploadedChunks,
+                paused: false,
+                pauseRequested: false,
+                taskId: taskId,
+                uploadPath: lockedUploadPath,
+                batchId: null
+            };
+        }
+
+        async function tryResumeUploadFromBrowserCache(taskId, serverTask, options = {}) {
+            const cachedFile = await getCachedUploadFileForResume(taskId, serverTask);
+            if (!cachedFile) {
+                return false;
+            }
+
+            const lockedUploadPath = String((serverTask && serverTask.upload_path) || '');
+            activeTasks[taskId] = buildUploadTaskState(taskId, cachedFile, serverTask, lockedUploadPath);
+
+            if (options.closeIncompleteNotification) {
+                closeIncompleteTasksNotification();
+            }
+
+            console.log('已从浏览器本地缓存恢复上传文件:', cachedFile.name);
+            showProgress('⬆️ 正在恢复上传...', taskId);
+            startUploadFromChunk(
+                taskId,
+                cachedFile,
+                Number(serverTask && serverTask.uploaded_chunks || 0),
+                lockedUploadPath
+            );
+            return true;
+        }
+
         function fetchWithPresence(url, options = {}) {
             const nextOptions = { ...options };
             const headers = new Headers(options.headers || {});
@@ -6400,6 +6876,343 @@ HTML_TEMPLATE = """
             }
             return fetch(url, nextOptions);
         }
+
+        const browseCurrentPath = {{ current_path | tojson }};
+        const browsePageSize = {{ browse_page_size | int }};
+        let browseLoadedCount = {{ initial_loaded_count | int }};
+        let browseTotalCount = {{ files_total_count | int }};
+        let browseLoading = false;
+        let browseObserver = null;
+
+        function encodePathForUrl(path) {
+            return String(path || '')
+                .split('/')
+                .filter(part => part.length > 0)
+                .map(part => encodeURIComponent(part))
+                .join('/');
+        }
+
+        function buildPathUrl(base, path) {
+            const encodedPath = encodePathForUrl(path);
+            return encodedPath ? `${base}/${encodedPath}` : base;
+        }
+
+        function createActionIcon(src, width = 25, height = 25) {
+            const img = document.createElement('img');
+            img.src = src;
+            img.style.width = `${width}px`;
+            img.style.height = `${height}px`;
+            img.style.verticalAlign = 'middle';
+            img.style.marginRight = '4px';
+            return img;
+        }
+
+        function createStyledButton(label, className = 'btn-download') {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = className;
+            button.style.padding = '8px 16px';
+            button.style.fontSize = '14px';
+            button.appendChild(document.createTextNode(label));
+            return button;
+        }
+
+        function createStyledLink(label, href, className = 'btn-download') {
+            const link = document.createElement('a');
+            link.href = href;
+            link.className = className;
+            link.appendChild(document.createTextNode(label));
+            return link;
+        }
+
+        function buildFolderListItem(item) {
+            const folderPath = String(item.relative_path || '');
+            const folderDisplayName = String(item.display_name || item.name || '').replace(/\/$/, '');
+            const li = document.createElement('li');
+            li.className = 'file-item folder-item';
+            li.dataset.folder = folderPath;
+            li.dataset.filepath = folderPath;
+            li.dataset.isFolder = 'true';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'file-checkbox';
+            checkbox.setAttribute('data-path', folderPath);
+            checkbox.style.width = '20px';
+            checkbox.style.height = '20px';
+            checkbox.style.cursor = 'pointer';
+            checkbox.style.marginRight = '10px';
+            checkbox.addEventListener('click', function(event) {
+                event.stopPropagation();
+                updateBatchToolbar();
+            });
+            li.appendChild(checkbox);
+
+            const info = document.createElement('div');
+            info.className = 'file-info';
+            info.style.cursor = 'pointer';
+            info.addEventListener('click', function() {
+                window.location.href = buildPathUrl('/browse', folderPath);
+            });
+
+            const icon = document.createElement('div');
+            icon.className = 'file-icon';
+            icon.style.fontSize = '36px';
+            icon.textContent = '📁';
+            info.appendChild(icon);
+
+            const details = document.createElement('div');
+            details.className = 'file-details';
+
+            const name = document.createElement('div');
+            name.className = 'file-name-text';
+            name.title = folderDisplayName;
+            name.textContent = folderDisplayName;
+            details.appendChild(name);
+
+            const meta = document.createElement('div');
+            meta.className = 'file-meta';
+            const sizeSpan = document.createElement('span');
+            sizeSpan.appendChild(createActionIcon('/static/目录.png'));
+            sizeSpan.appendChild(document.createTextNode(item.size || '文件夹'));
+            meta.appendChild(sizeSpan);
+            const timeSpan = document.createElement('span');
+            timeSpan.textContent = item.time || '';
+            meta.appendChild(timeSpan);
+            details.appendChild(meta);
+            info.appendChild(details);
+            li.appendChild(info);
+
+            const actions = document.createElement('div');
+            actions.className = 'file-actions';
+
+            const renameBtn = createStyledButton('重命名');
+            renameBtn.prepend(createActionIcon('/static/钢笔.png'));
+            renameBtn.addEventListener('click', function(event) {
+                event.stopPropagation();
+                renameItem(folderPath, folderDisplayName, true);
+            });
+            actions.appendChild(renameBtn);
+
+            const downloadLink = createStyledLink('下载', buildPathUrl('/download_folder', folderPath));
+            downloadLink.classList.add('btn-folder-download');
+            downloadLink.dataset.folderDownload = '1';
+            downloadLink.prepend(createActionIcon('/static/下载.png'));
+            downloadLink.addEventListener('click', function(event) {
+                event.stopPropagation();
+            });
+            actions.appendChild(downloadLink);
+
+            const deleteForm = document.createElement('form');
+            deleteForm.method = 'post';
+            deleteForm.action = buildPathUrl('/delete_folder', folderPath);
+            deleteForm.style.display = 'inline';
+            deleteForm.style.margin = '0';
+            deleteForm.addEventListener('click', function(event) {
+                event.stopPropagation();
+            });
+            const deleteBtn = createStyledButton('删除', 'btn-delete');
+            deleteBtn.prepend(createActionIcon('/static/删除.png'));
+            deleteBtn.addEventListener('click', function(event) {
+                event.stopPropagation();
+                checkDeletePermission(event, '文件夹', folderDisplayName, true);
+            });
+            deleteForm.appendChild(deleteBtn);
+            actions.appendChild(deleteForm);
+
+            li.appendChild(actions);
+            return li;
+        }
+
+        function buildFileListItem(item) {
+            const filePath = String(item.relative_path || '');
+            const fileName = String(item.name || '');
+            const li = document.createElement('li');
+            li.className = 'file-item';
+            li.dataset.filepath = filePath;
+            li.dataset.isFolder = 'false';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'file-checkbox';
+            checkbox.setAttribute('data-path', filePath);
+            checkbox.style.width = '20px';
+            checkbox.style.height = '20px';
+            checkbox.style.cursor = 'pointer';
+            checkbox.style.marginRight = '10px';
+            checkbox.addEventListener('click', function(event) {
+                event.stopPropagation();
+                updateBatchToolbar();
+            });
+            li.appendChild(checkbox);
+
+            const info = document.createElement('div');
+            info.className = 'file-info';
+            const icon = document.createElement('div');
+            icon.className = 'file-icon';
+            icon.textContent = item.icon || getFileIcon(fileName);
+            info.appendChild(icon);
+
+            const details = document.createElement('div');
+            details.className = 'file-details';
+            const name = document.createElement('div');
+            name.className = 'file-name-text';
+            name.title = filePath;
+            name.textContent = fileName;
+            details.appendChild(name);
+            const meta = document.createElement('div');
+            meta.className = 'file-meta';
+            const sizeSpan = document.createElement('span');
+            sizeSpan.appendChild(createActionIcon('/static/目录.png'));
+            sizeSpan.appendChild(document.createTextNode(item.size || ''));
+            meta.appendChild(sizeSpan);
+            const timeSpan = document.createElement('span');
+            timeSpan.textContent = item.time || '';
+            meta.appendChild(timeSpan);
+            details.appendChild(meta);
+            info.appendChild(details);
+            li.appendChild(info);
+
+            const actions = document.createElement('div');
+            actions.className = 'file-actions';
+
+            if (item.is_previewable) {
+                const previewBtn = createStyledButton(
+                    item.preview_mode && item.preview_mode !== 'preview' ? '预览/编辑' : '预览'
+                );
+                previewBtn.addEventListener('click', function() {
+                    openFilePreview(filePath, item.preview_mode || 'preview');
+                });
+                actions.appendChild(previewBtn);
+            }
+
+            const shareBtn = createStyledButton('分享');
+            shareBtn.addEventListener('click', function() {
+                createShareLink(filePath, fileName);
+            });
+            actions.appendChild(shareBtn);
+
+            const renameBtn = createStyledButton('重命名');
+            renameBtn.prepend(createActionIcon('/static/钢笔.png'));
+            renameBtn.addEventListener('click', function() {
+                renameItem(filePath, fileName, false);
+            });
+            actions.appendChild(renameBtn);
+
+            const downloadLink = createStyledLink('下载', buildPathUrl('/download', filePath));
+            downloadLink.prepend(createActionIcon('/static/下载.png'));
+            actions.appendChild(downloadLink);
+
+            const deleteForm = document.createElement('form');
+            deleteForm.method = 'post';
+            deleteForm.action = buildPathUrl('/delete', filePath);
+            deleteForm.style.display = 'inline';
+            deleteForm.style.margin = '0';
+            const deleteBtn = createStyledButton('删除', 'btn-delete');
+            deleteBtn.prepend(createActionIcon('/static/删除.png'));
+            deleteBtn.addEventListener('click', function(event) {
+                checkDeletePermission(event, '文件', fileName, false);
+            });
+            deleteForm.appendChild(deleteBtn);
+            actions.appendChild(deleteForm);
+
+            li.appendChild(actions);
+            return li;
+        }
+
+        function createBrowseListItem(item) {
+            return item && item.is_folder ? buildFolderListItem(item) : buildFileListItem(item || {});
+        }
+
+        function updateBrowseLoadedState() {
+            const loadedText = document.getElementById('browseLoadedText');
+            const loadMoreBtn = document.getElementById('loadMoreBtn');
+            if (loadedText) {
+                loadedText.textContent = `已加载 ${browseLoadedCount} / ${browseTotalCount} 项`;
+            }
+            if (loadMoreBtn) {
+                loadMoreBtn.style.display = browseLoadedCount < browseTotalCount ? 'inline-flex' : 'none';
+                loadMoreBtn.disabled = browseLoading;
+                loadMoreBtn.textContent = browseLoading ? '加载中...' : '加载更多';
+            }
+        }
+
+        async function loadMoreFiles() {
+            if (browseLoading || browseLoadedCount >= browseTotalCount) {
+                return;
+            }
+            browseLoading = true;
+            updateBrowseLoadedState();
+            try {
+                const url = buildPathUrl('/api/browse_page', browseCurrentPath)
+                    + `?offset=${browseLoadedCount}&limit=${browsePageSize}`;
+                const response = await fetchWithPresence(url);
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || '加载更多文件失败');
+                }
+                const fileList = document.getElementById('fileList');
+                (data.items || []).forEach(item => {
+                    fileList.appendChild(createBrowseListItem(item));
+                });
+                browseLoadedCount = Number(data.next_offset || browseLoadedCount);
+                browseTotalCount = Number(data.total_count || browseTotalCount);
+                enableFileDrag();
+                enableFolderDrop();
+                enableBreadcrumbDrop();
+            } catch (error) {
+                console.error('加载更多文件失败:', error);
+            } finally {
+                browseLoading = false;
+                updateBrowseLoadedState();
+            }
+        }
+
+        async function refreshDirectorySize() {
+            const totalSizeValue = document.getElementById('totalSizeValue');
+            const totalSizeHint = document.getElementById('totalSizeHint');
+            if (!totalSizeValue) {
+                return;
+            }
+            try {
+                const response = await fetchWithPresence(buildPathUrl('/api/directory_size', browseCurrentPath));
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || '目录大小计算失败');
+                }
+                totalSizeValue.textContent = data.size || '0.0 B';
+                if (totalSizeHint) {
+                    totalSizeHint.textContent = '已异步完成整个目录大小统计';
+                }
+            } catch (error) {
+                console.error('目录大小计算失败:', error);
+                totalSizeValue.textContent = '统计失败';
+                if (totalSizeHint) {
+                    totalSizeHint.textContent = '可以刷新页面后重试统计';
+                }
+            }
+        }
+
+        function setupBrowseLazyLoading() {
+            updateBrowseLoadedState();
+            const sentinel = document.getElementById('browseLoadSentinel');
+            if (!sentinel || browseLoadedCount >= browseTotalCount || !('IntersectionObserver' in window)) {
+                return;
+            }
+            browseObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        loadMoreFiles();
+                    }
+                });
+            }, {
+                rootMargin: '320px 0px'
+            });
+            browseObserver.observe(sentinel);
+        }
+
+        requestAnimationFrame(refreshDirectorySize);
+        requestAnimationFrame(setupBrowseLazyLoading);
 
         function setLocalRealtimeUpload(taskId, patch) {
             const existing = localRealtimeUploads[taskId] || {};
@@ -6609,14 +7422,19 @@ HTML_TEMPLATE = """
         
         // 直接上传文件列表
         function uploadFilesDirectly(fileArray) {
-            fileArray.forEach(file => {
+            const files = Array.isArray(fileArray) ? fileArray.filter(Boolean) : [];
+            if (!files.length) {
+                return;
+            }
+            const batchId = createUploadBatch(files.length);
+            files.forEach(file => {
                 if (file.size > 10 * 1024 * 1024) {
                     // 大文件使用分块上传
                     const taskId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
-                    uploadFileInChunks(file, taskId);
+                    uploadFileInChunks(file, taskId, batchId);
                 } else {
                     // 小文件直接上传
-                    uploadSmallFile(file);
+                    uploadSmallFile(file, batchId);
                 }
             });
         }
@@ -6704,7 +7522,7 @@ HTML_TEMPLATE = """
         }
         
         // 上传小文件
-        function uploadSmallFile(file) {
+        function uploadSmallFile(file, batchId = null) {
             // 检查当前是否有大文件正在上传
             const hasActiveChunkUpload = Object.keys(activeTasks).some(tid => {
                 const t = activeTasks[tid];
@@ -6765,11 +7583,16 @@ HTML_TEMPLATE = """
                         if (response.failed && response.failed.length > 0) {
                             console.warn('部分文件上传失败:', response.failed);
                         }
-                        
-                        setTimeout(() => window.location.reload(), 500);
+                        finishUploadBatchItem(batchId, {
+                            failed: false,
+                            shouldReload: true
+                        });
                     } catch (e) {
                         console.error('解析响应失败:', e);
-                        setTimeout(() => window.location.reload(), 500);
+                        finishUploadBatchItem(batchId, {
+                            failed: false,
+                            shouldReload: true
+                        });
                     }
                 } else {
                     if (!hasActiveChunkUpload) {
@@ -6783,6 +7606,10 @@ HTML_TEMPLATE = """
                     } catch (e) {
                         showAlert('上传失败', '上传失败，请重试 (状态码: ' + xhr.status + ')');
                     }
+                    finishUploadBatchItem(batchId, {
+                        failed: true,
+                        shouldReload: false
+                    });
                 }
             };
             
@@ -6796,6 +7623,10 @@ HTML_TEMPLATE = """
                     hideProgress();
                 }
                 showAlert('上传失败', '上传过程中发生错误，详情请查看控制台（F12）');
+                finishUploadBatchItem(batchId, {
+                    failed: true,
+                    shouldReload: false
+                });
             };
             
             xhr.onabort = function() {
@@ -7335,6 +8166,23 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            const getActivityMeta = function(action) {
+                const normalized = String(action || '').trim();
+                if (normalized === '上传') {
+                    return { icon: '上传', className: 'activity-upload' };
+                }
+                if (normalized === '下载') {
+                    return { icon: '下载', className: 'activity-download' };
+                }
+                if (normalized === '删除') {
+                    return {
+                        icon: '<img src="/static/删除.png" style="width: 28px; height: 28px; vertical-align: middle;">',
+                        className: 'activity-delete'
+                    };
+                }
+                return null;
+            };
+
             const refreshing = container.querySelector('.refreshing-indicator');
             if (!refreshing) {
                 const indicator = document.createElement('div');
@@ -7347,7 +8195,7 @@ HTML_TEMPLATE = """
                     height: 8px;
                     background: rgba(16, 185, 129, 0.8);
                     border-radius: 50%;
-                    animation: pulse 0.5s ease-in-out;
+                    animation: activityDotPulse 0.5s ease-in-out;
                 `;
                 container.style.position = 'relative';
                 container.appendChild(indicator);
@@ -7371,19 +8219,7 @@ HTML_TEMPLATE = """
             if (mergedActiveTasks.length > 0) {
                 mergedActiveTasks.forEach(task => {
                     const div = document.createElement('div');
-                    div.className = 'activity-item active-task';
-                    div.style.cssText = `
-                        background: rgba(16, 185, 129, 0.15);
-                        border: 1px solid rgba(16, 185, 129, 0.3);
-                        padding: 12px;
-                        border-radius: 8px;
-                        margin-bottom: 8px;
-                        word-wrap: break-word;
-                        overflow-wrap: break-word;
-                        overflow: hidden;
-                        max-width: 100%;
-                        box-sizing: border-box;
-                    `;
+                    div.className = 'activity-item active-task activity-upload';
 
                     let icon = '上传中';
                     let actionText = '正在上传';
@@ -7399,32 +8235,27 @@ HTML_TEMPLATE = """
                             : '传输中');
 
                     const progressHtml = `
-                        <div style="margin-top: 6px; width: 100%; box-sizing: border-box;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px; width: 100%; box-sizing: border-box;">
-                                <span style="font-size: 11px; color: rgba(255,255,255,0.8); flex-shrink: 0;">
+                        <div class="activity-task-progress">
+                            <div class="activity-task-progress-row">
+                                <span class="progress-label" title="${escapeHtml(progressDetail)}">
                                     ${escapeHtml(progressDetail)}
                                 </span>
-                                <span style="font-size: 11px; color: rgba(255,255,255,0.8); flex-shrink: 0;">
+                                <span class="progress-value">
                                     ${progressText}%
                                 </span>
                             </div>
-                            <div style="width: 100%; height: 6px; background: rgba(0,0,0,0.2); border-radius: 3px; overflow: hidden; box-sizing: border-box;">
-                                <div style="width: ${clampProgress(task.progress)}%; height: 100%; background: linear-gradient(90deg, #10b981, #059669); border-radius: 3px; transition: width 0.3s ease; max-width: 100%;"></div>
+                            <div class="activity-task-progress-bar">
+                                <div class="activity-task-progress-fill" style="width: ${clampProgress(task.progress)}%;"></div>
                             </div>
                         </div>
                     `;
 
+                    const safeFilename = escapeHtml(task.filename || '未命名文件');
                     div.innerHTML = `
-                        <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 100%; box-sizing: border-box;">
-                            <div style="flex: 1; min-width: 0; margin-right: 8px;">
-                                <div style="margin-bottom: 4px; word-wrap: break-word; overflow-wrap: break-word;">
-                                    ${icon} <strong>${escapeHtml(task.username || currentSessionUsername)}</strong> ${escapeHtml(actionText)}
-                                </div>
-                                <div style="font-size: 12px; color: rgba(255,255,255,0.9); word-break: break-all; overflow: hidden; text-overflow: ellipsis;">
-                                    文件 ${escapeHtml(task.filename || '未命名文件')}
-                                </div>
-                            </div>
+                        <div class="activity-task-title">
+                            ${icon} <strong>${escapeHtml(task.username || currentSessionUsername)}</strong> ${escapeHtml(actionText)}
                         </div>
+                        <span class="activity-task-file" title="${safeFilename}">文件 ${safeFilename}</span>
                         ${progressHtml}
                     `;
 
@@ -7445,18 +8276,16 @@ HTML_TEMPLATE = """
 
             if (Array.isArray(activities)) {
                 activities.slice(-10).reverse().forEach(activity => {
+                    const meta = getActivityMeta(activity.action);
+                    if (!meta) {
+                        return;
+                    }
                     const div = document.createElement('div');
-                    div.className = 'activity-item';
-                    let icon = '动态';
-                    if (activity.action === '上传') icon = '上传';
-                    else if (activity.action === '下载') icon = '下载';
-                    else if (activity.action === '上线') icon = '在线';
-                    else if (activity.action === '删除') icon = '<img src="/static/删除.png" style="width: 28px; height: 28px; vertical-align: middle;">';
-                    else if (activity.action === '重命名') icon = '<img src="/static/钢笔.png" style="width: 28px; height: 28px; vertical-align: middle;">';
+                    div.className = `activity-item ${meta.className}`;
 
                     const timeAgo = formatTimeAgo(activity.timestamp);
                     const fileInfo = activity.filename ? ` ${escapeHtml(activity.filename)}` : '';
-                    div.innerHTML = `${icon} <strong>${escapeHtml(activity.username || '匿名用户')}</strong> ${escapeHtml(activity.action || '动态')}${fileInfo}<div class="activity-time">${escapeHtml(timeAgo)}</div>`;
+                    div.innerHTML = `${meta.icon} <strong>${escapeHtml(activity.username || '匿名用户')}</strong> ${escapeHtml(activity.action || '动态')}${fileInfo}<div class="activity-time">${escapeHtml(timeAgo)}</div>`;
                     container.appendChild(div);
                     renderedItems += 1;
                 });
@@ -7905,6 +8734,10 @@ HTML_TEMPLATE = """
             document.querySelectorAll('.file-item').forEach(function(fileItem) {
                 const nameEl = fileItem.querySelector('.file-name-text');
                 if (nameEl) {
+                    if (fileItem.dataset.dragReady === '1') {
+                        return;
+                    }
+                    fileItem.dataset.dragReady = '1';
                     fileItem.setAttribute('draggable', 'true');
                     fileItem.classList.add('draggable');
                     
@@ -7948,6 +8781,10 @@ HTML_TEMPLATE = """
         function enableFolderDrop() {
             // 文件夹目标：移动到指定文件夹
             document.querySelectorAll('.folder-item').forEach(function(folder) {
+                if (folder.dataset.dropReady === '1') {
+                    return;
+                }
+                folder.dataset.dropReady = '1';
                 folder.addEventListener('dragover', function(e) {
                     if (draggedElement && !this.classList.contains('dragging')) {
                         e.preventDefault();
@@ -8032,7 +8869,8 @@ HTML_TEMPLATE = """
 
             // 禁用拖到空白区域的默认行为（现在使用面包屑和文件夹拖放）
             const filesSection = document.querySelector('.files-section');
-            if (filesSection) {
+            if (filesSection && filesSection.dataset.dropReady !== '1') {
+                filesSection.dataset.dropReady = '1';
                 filesSection.addEventListener('dragover', function(e) {
                     if (!draggedElement) return;
                     // 如果悬停在文件夹或面包屑上，交由它们处理
@@ -8049,6 +8887,10 @@ HTML_TEMPLATE = """
         // 为面包屑导航添加拖放目标功能
         function enableBreadcrumbDrop() {
             document.querySelectorAll('.breadcrumb-drop-target').forEach(function(breadcrumb) {
+                if (breadcrumb.dataset.dropReady === '1') {
+                    return;
+                }
+                breadcrumb.dataset.dropReady = '1';
                 breadcrumb.addEventListener('dragover', function(e) {
                     if (draggedElement) {
                         e.preventDefault();
@@ -8347,70 +9189,51 @@ HTML_TEMPLATE = """
                     updateProgress(currentProgress, '正在打包文件，请勿切换页面...');
                 }
             }, 800);
-            
-            // 使用 XMLHttpRequest 以便更好地控制下载
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/batch_download', true);
-            xhr.setRequestHeader('Content-Type', 'application/json');
-            xhr.responseType = 'blob';
-            
-            xhr.onload = function() {
-                clearInterval(progressInterval);
-                
-                if (xhr.status === 200) {
-                    updateProgress(95, '准备下载...');
-                    
-                    const blob = xhr.response;
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `批量下载_${new Date().getTime()}.zip`;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    window.URL.revokeObjectURL(url);
-                    
-                    updateProgress(100, '下载完成！');
-                    setTimeout(() => {
-                        hideProgress();
-                        cancelBatchSelection();
-                    }, 1000);
-                } else {
-                    hideProgress();
-                    showAlert('❌ 错误', '批量下载失败');
-                }
-            };
-            
-            xhr.onerror = function() {
-                clearInterval(progressInterval);
-                hideProgress();
-                showAlert('❌ 错误', '批量下载时发生网络错误，请检查网络连接');
-            };
-            
-            xhr.onabort = function() {
-                clearInterval(progressInterval);
-                hideProgress();
-                showAlert('⚠️ 已取消', '批量下载已被取消');
-            };
-            
-            // 发送请求
-            xhr.send(JSON.stringify({ paths: paths }));
-            
-            // 阻止页面跳转（警告用户）
-            const beforeUnloadHandler = (e) => {
-                e.preventDefault();
-                e.returnValue = '正在下载文件，确定要离开吗？';
-                return e.returnValue;
-            };
-            
-            window.addEventListener('beforeunload', beforeUnloadHandler);
-            
-            // 下载完成后移除警告
-            xhr.addEventListener('loadend', () => {
-                setTimeout(() => {
-                    window.removeEventListener('beforeunload', beforeUnloadHandler);
-                }, 2000);
+
+            // 使用浏览器原生表单下载，避免大 ZIP 先进入前端 blob 内存后再无法触发保存。
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            iframe.name = `batchDownloadFrame_${Date.now()}`;
+            document.body.appendChild(iframe);
+
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/api/batch_download';
+            form.target = iframe.name;
+            form.style.display = 'none';
+
+            paths.forEach(path => {
+                const input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = 'paths';
+                input.value = path;
+                form.appendChild(input);
             });
+
+            document.body.appendChild(form);
+            form.submit();
+
+            // 这里无法精确获知浏览器何时真正开始保存，只保留打包提示并给足时间。
+            setTimeout(() => {
+                updateProgress(95, '下载请求已发送，浏览器开始接收后会显示下载任务...');
+            }, 1500);
+            setTimeout(() => {
+                clearInterval(progressInterval);
+                updateProgress(100, '如未自动弹出，请检查浏览器下载栏或拦截提示。');
+                setTimeout(() => {
+                    hideProgress();
+                    cancelBatchSelection();
+                    if (form.parentNode) {
+                        form.parentNode.removeChild(form);
+                    }
+                    // iframe 稍后再移除，避免浏览器还在处理下载时被提前清掉。
+                    setTimeout(() => {
+                        if (iframe.parentNode) {
+                            iframe.parentNode.removeChild(iframe);
+                        }
+                    }, 30000);
+                }, 1500);
+            }, 8000);
         }
         
         // 文件预览
@@ -8529,37 +9352,13 @@ HTML_TEMPLATE = """
         // 为所有下载按钮添加进度条
         document.querySelectorAll('.btn-download').forEach(function(btn) {
             btn.addEventListener('click', function(e) {
+                const href = this.getAttribute('href') || '';
+
                 // 如果是文件夹下载，显示特殊提示
-                if (this.href.includes('/download_folder/')) {
-                    e.preventDefault();
-                    showProgress('<img src="/static/下载.png" style="width: 35px; height: 35px; vertical-align: middle; margin-right: 8px;">打包中...');
-                    updateProgress(30, '正在压缩文件夹，请稍候...');
-                    
-                    // 创建隐藏的 iframe 来下载
-                    const iframe = document.createElement('iframe');
-                    iframe.style.display = 'none';
-                    iframe.src = this.href;
-                    document.body.appendChild(iframe);
-                    
-                    // 模拟进度
-                    let progress = 30;
-                    const interval = setInterval(function() {
-                        progress += 10;
-                        if (progress >= 90) {
-                            clearInterval(interval);
-                            updateProgress(90, '即将完成...');
-                        } else {
-                            updateProgress(progress, '正在压缩文件夹，请稍候...');
-                        }
-                    }, 500);
-                    
-                    // 5秒后隐藏进度条（假设下载已开始）
-                    setTimeout(function() {
-                        clearInterval(interval);
-                        updateProgress(100, '下载已开始！');
-                        setTimeout(hideProgress, 1000);
-                        document.body.removeChild(iframe);
-                    }, 5000);
+                if (href.includes('/download_folder/')) {
+                    // 文件夹打包可能持续较久，这里直接交给浏览器原生下载，
+                    // 避免像旧逻辑那样 5 秒后提前移除 iframe 导致下载中断。
+                    return;
                 } else {
                     // 普通文件下载不显示进度条，直接开始下载
                     // 让浏览器直接处理下载
@@ -8792,13 +9591,19 @@ HTML_TEMPLATE = """
         // 恢复上传任务
         async function resumeUploadTask(taskId, serverTask) {
             const frontendTask = activeTasks[taskId];
+            const lockedUploadPath = ((frontendTask && frontendTask.uploadPath) || serverTask.upload_path || '');
 
             console.log('恢复上传任务:', taskId);
             console.log('前端任务:', frontendTask);
             console.log('前端任务是否有文件对象:', frontendTask ? !!frontendTask.file : false);
 
             if (!frontendTask || !frontendTask.file) {
-                console.log('文件对象已丢失，需要重新选择');
+                const restoredFromCache = await tryResumeUploadFromBrowserCache(taskId, serverTask);
+                if (restoredFromCache) {
+                    return;
+                }
+
+                console.log('文件对象已丢失，本地缓存不可用，需要重新选择');
 
                 const result = await showConfirm(
                     '📂 需要重新选择文件',
@@ -8833,17 +9638,13 @@ HTML_TEMPLATE = """
                         return;
                     }
 
-                    activeTasks[taskId] = {
-                        type: 'upload',
-                        file: file,
-                        totalChunks: expectedChunks || actualChunks,
-                        uploadedChunks: serverTask.uploaded_chunks || 0,
-                        paused: false,
-                        pauseRequested: false
-                    };
+                    activeTasks[taskId] = buildUploadTaskState(taskId, file, serverTask, lockedUploadPath);
+                    cacheUploadFileForResume(taskId, file).catch(error => {
+                        console.warn('恢复上传时缓存文件失败:', error);
+                    });
 
                     showProgress('⬆️ 上传中...', taskId);
-                    startUploadFromChunk(taskId, file, serverTask.uploaded_chunks || 0);
+                    startUploadFromChunk(taskId, file, serverTask.uploaded_chunks || 0, lockedUploadPath);
                 };
                 fileInput.click();
             } else {
@@ -8854,9 +9655,10 @@ HTML_TEMPLATE = """
 
                 frontendTask.paused = false;
                 frontendTask.pauseRequested = false;
+                frontendTask.uploadPath = lockedUploadPath;
 
                 showProgress('⬆️ 上传中...', taskId);
-                startUploadFromChunk(taskId, frontendTask.file, serverTask.uploaded_chunks || 0);
+                startUploadFromChunk(taskId, frontendTask.file, serverTask.uploaded_chunks || 0, lockedUploadPath);
             }
         }
         
@@ -8884,6 +9686,10 @@ HTML_TEMPLATE = """
             }
 
             console.log('开始删除任务:', taskId);
+            const deletedTask = activeTasks[taskId];
+            const deletedBatchId = deletedTask && deletedTask.type === 'upload'
+                ? (deletedTask.batchId || null)
+                : null;
 
             if (activeTasks[taskId]) {
                 if (activeTasks[taskId].xhr) {
@@ -8899,8 +9705,15 @@ HTML_TEMPLATE = """
 
                 if (data.success) {
                     console.log('任务删除成功:', taskId);
+                    await removeCachedUploadFile(taskId);
                     updateTasksList();
                     updateActivities();
+                    if (deletedBatchId) {
+                        finishUploadBatchItem(deletedBatchId, {
+                            failed: true,
+                            shouldReload: false
+                        });
+                    }
                 } else {
                     console.error('删除任务失败:', data.message);
                     await showAlert('错误', data.message || '删除任务失败');
@@ -8909,6 +9722,51 @@ HTML_TEMPLATE = """
                 console.error('删除任务请求失败:', error);
                 await showAlert('错误', '删除任务失败: ' + error.message);
             }
+        }
+
+        function completeChunkUploadTask(taskId) {
+            const task = activeTasks[taskId];
+            const batchId = task && task.batchId ? task.batchId : null;
+            removeLocalRealtimeUpload(taskId);
+            removeCachedUploadFile(taskId).catch(error => {
+                console.warn('清理上传缓存失败:', error);
+            });
+            if (activeTasks[taskId]) {
+                delete activeTasks[taskId];
+            }
+
+            const finalizeClientState = function() {
+                updateTasksList();
+                updateActivities();
+                finishUploadBatchItem(batchId, {
+                    failed: false,
+                    shouldReload: true
+                });
+            };
+
+            fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
+                .then(finalizeClientState)
+                .catch(finalizeClientState);
+        }
+
+        function markChunkUploadFailed(taskId, detailText) {
+            const task = activeTasks[taskId];
+            if (!task) {
+                return;
+            }
+
+            const batchId = task.batchId || null;
+            task.batchId = null;
+            task.error = detailText || '上传失败';
+            setLocalRealtimeUpload(taskId, {
+                status: 'error',
+                detailText: detailText || '上传失败'
+            });
+            updateTasksList();
+            finishUploadBatchItem(batchId, {
+                failed: true,
+                shouldReload: false
+            });
         }
 
         // 清理所有任务
@@ -8938,7 +9796,7 @@ HTML_TEMPLATE = """
         }
 
         // 分块上传文件
-        function uploadFileInChunks(file, taskId) {
+        function uploadFileInChunks(file, taskId, batchId = null) {
             const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk (提高上传速度)
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
             const uploadPathSelect = document.getElementById('uploadPathSelect');
@@ -8951,8 +9809,13 @@ HTML_TEMPLATE = """
                 totalChunks: totalChunks,
                 uploadedChunks: 0,
                 paused: false,
-                taskId: taskId // 保存taskId用于更新进度
+                taskId: taskId, // 保存taskId用于更新进度
+                uploadPath: selectedPath || '',
+                batchId: batchId
             };
+            cacheUploadFileForResume(taskId, file).catch(error => {
+                console.warn('上传开始时缓存文件失败:', error);
+            });
             setLocalRealtimeUpload(taskId, {
                 type: 'upload',
                 status: 'running',
@@ -9043,12 +9906,17 @@ HTML_TEMPLATE = """
         }
         
         // 从指定分块开始上传
-        function startUploadFromChunk(taskId, file, startChunkIndex) {
+        function startUploadFromChunk(taskId, file, startChunkIndex, uploadPathOverride = null) {
             const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk (提高上传速度)
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
             let uploadedChunks = startChunkIndex;
+            const existingTask = activeTasks[taskId];
             const uploadPathSelect = document.getElementById('uploadPathSelect');
-            const selectedPath = uploadPathSelect ? uploadPathSelect.value : '{{ current_path }}';
+            const selectedPath = uploadPathOverride !== null && uploadPathOverride !== undefined
+                ? String(uploadPathOverride)
+                : ((existingTask && existingTask.uploadPath !== undefined)
+                    ? String(existingTask.uploadPath || '')
+                    : (uploadPathSelect ? uploadPathSelect.value : '{{ current_path }}'));
             
             console.log('startUploadFromChunk - taskId:', taskId, '文件:', file.name, '从分块:', startChunkIndex, '开始');
             
@@ -9065,7 +9933,9 @@ HTML_TEMPLATE = """
                     uploadedChunks: startChunkIndex,
                     paused: false,
                     pauseRequested: false,
-                    taskId: taskId
+                    taskId: taskId,
+                    uploadPath: selectedPath || '',
+                    batchId: null
                 };
             } else {
                 console.log('更新现有任务对象');
@@ -9075,7 +9945,11 @@ HTML_TEMPLATE = """
                 activeTasks[taskId].paused = false;
                 activeTasks[taskId].pauseRequested = false;
                 activeTasks[taskId].taskId = taskId;
+                activeTasks[taskId].uploadPath = selectedPath || '';
             }
+            cacheUploadFileForResume(taskId, file).catch(error => {
+                console.warn('继续上传时缓存文件失败:', error);
+            });
             setLocalRealtimeUpload(taskId, {
                 type: 'upload',
                 status: 'running',
@@ -9125,22 +9999,9 @@ HTML_TEMPLATE = """
             
             // 检查是否已完成
             if (chunkIndex >= totalChunks) {
-                // 所有分块上传完成
-                    removeLocalRealtimeUpload(taskId);
-                    delete activeTasks[taskId];
-                    fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
-                        .then(() => {
-                            updateTasksList();
-                            updateActivities();
-                            setTimeout(() => window.location.reload(), 500);
-                        })
-                        .catch(() => {
-                            updateTasksList();
-                            updateActivities();
-                            setTimeout(() => window.location.reload(), 500);
-                        });
-                    return;
-                }
+                completeChunkUploadTask(taskId);
+                return;
+            }
                 
             // 准备分块数据
             const start = chunkIndex * CHUNK_SIZE;
@@ -9153,10 +10014,8 @@ HTML_TEMPLATE = """
                 formData.append('total_chunks', totalChunks);
                 formData.append('filename', file.name);
                 
-                // 获取用户选择的上传路径
-                const uploadPathSelect = document.getElementById('uploadPathSelect');
-                const selectedPath = uploadPathSelect ? uploadPathSelect.value : '{{ current_path }}';
-                formData.append('upload_path', selectedPath || '');
+                const lockedUploadPath = String(task.uploadPath || '');
+                formData.append('upload_path', lockedUploadPath);
                 
                 formData.append('chunk', chunk);
                 
@@ -9237,19 +10096,7 @@ HTML_TEMPLATE = """
                         }
                         
                         if (response.completed) {
-                            removeLocalRealtimeUpload(taskId);
-                            delete activeTasks[taskId];
-                            fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
-                                .then(() => {
-                                    updateTasksList();
-                                    updateActivities();
-                                    setTimeout(() => window.location.reload(), 500);
-                                })
-                                .catch(() => {
-                                    updateTasksList();
-                                    updateActivities();
-                                    setTimeout(() => window.location.reload(), 500);
-                                });
+                            completeChunkUploadTask(taskId);
                             return;
                         }
                         
@@ -9273,23 +10120,13 @@ HTML_TEMPLATE = """
                     } catch (e) {
                         console.error('解析响应失败:', e);
                         if (activeTasks[taskId]) {
-                            activeTasks[taskId].error = '响应解析失败';
-                            setLocalRealtimeUpload(taskId, {
-                                status: 'error',
-                                detailText: '响应解析失败'
-                            });
-                            updateTasksList();
+                            markChunkUploadFailed(taskId, '响应解析失败');
                         }
                     }
                 } else {
                         console.error('上传分块失败:', xhr.statusText);
                         if (activeTasks[taskId]) {
-                            activeTasks[taskId].error = xhr.statusText;
-                            setLocalRealtimeUpload(taskId, {
-                                status: 'error',
-                                detailText: xhr.statusText || '上传失败'
-                            });
-                            updateTasksList();
+                            markChunkUploadFailed(taskId, xhr.statusText || '上传失败');
                         }
                     }
                 };
@@ -9297,12 +10134,7 @@ HTML_TEMPLATE = """
                 xhr.onerror = function() {
                     console.error('上传分块出错');
                     if (activeTasks[taskId] && !activeTasks[taskId].paused) {
-                        activeTasks[taskId].error = '网络错误';
-                        setLocalRealtimeUpload(taskId, {
-                            status: 'error',
-                            detailText: '网络错误'
-                        });
-                        updateTasksList();
+                        markChunkUploadFailed(taskId, '网络错误');
                     }
                 };
                 
@@ -9523,58 +10355,73 @@ HTML_TEMPLATE = """
         async function continueUpload(taskId, filename, totalChunks) {
             console.log('继续上传:', taskId, filename, totalChunks);
 
-            const proceed = await showConfirm(
-                '📂 选择文件继续上传',
-                `请重新选择文件“${filename}”以继续上传。\n\n系统会从上次中断的位置继续，已上传的分块不会重复上传。`
-            );
+            try {
+                const response = await fetch('/api/tasks');
+                const data = await response.json();
 
-            if (!proceed) {
-                return;
-            }
-
-            const fileInput = document.createElement('input');
-            fileInput.type = 'file';
-            fileInput.accept = '*/*';
-
-            fileInput.onchange = async function(e) {
-                const file = e.target.files[0];
-                if (!file) {
+                if (!data.success || !data.tasks[taskId]) {
+                    await showAlert('错误', '无法获取任务信息，请删除该任务后重新上传。');
                     return;
                 }
 
-                const originalName = filename;
-                const selectedName = file.name;
+                const serverTask = data.tasks[taskId];
+                const restoredFromCache = await tryResumeUploadFromBrowserCache(taskId, serverTask, {
+                    closeIncompleteNotification: true
+                });
 
-                if (selectedName !== originalName) {
-                    const confirmed = await showConfirm(
-                        '⚠️ 文件名不匹配',
-                        `您选择的文件名是“${selectedName}”，而原文件名是“${originalName}”。\n\n确定要继续吗？这可能导致上传后的文件不完整。`
-                    );
-                    if (!confirmed) {
-                        return;
-                    }
+                if (restoredFromCache) {
+                    return;
                 }
 
-                closeIncompleteTasksNotification();
+                const proceed = await showConfirm(
+                    '📂 选择文件继续上传',
+                    `浏览器本地缓存不可用，请重新选择文件“${filename}”继续上传。\n\n系统会从上次中断的位置继续，已上传的分块不会重复上传。`
+                );
 
-                fetch('/api/tasks')
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success && data.tasks[taskId]) {
-                            const uploadedChunks = data.tasks[taskId].uploaded_chunks || 0;
-                            console.log('从分块继续上传:', uploadedChunks);
-                            startUploadFromChunk(taskId, file, uploadedChunks);
-                        } else {
-                            showAlert('错误', '无法获取任务信息，请删除该任务后重新上传。');
+                if (!proceed) {
+                    return;
+                }
+
+                const fileInput = document.createElement('input');
+                fileInput.type = 'file';
+                fileInput.accept = '*/*';
+
+                fileInput.onchange = async function(e) {
+                    const file = e.target.files[0];
+                    if (!file) {
+                        return;
+                    }
+
+                    const originalName = filename;
+                    const selectedName = file.name;
+
+                    if (selectedName !== originalName) {
+                        const confirmed = await showConfirm(
+                            '⚠️ 文件名不匹配',
+                            `您选择的文件名是“${selectedName}”，而原文件名是“${originalName}”。\n\n确定要继续吗？这可能导致上传后的文件不完整。`
+                        );
+                        if (!confirmed) {
+                            return;
                         }
-                    })
-                    .catch(error => {
-                        console.error('获取任务信息失败:', error);
-                        showAlert('错误', '获取任务信息失败');
-                    });
-            };
+                    }
 
-            fileInput.click();
+                    closeIncompleteTasksNotification();
+
+                    const uploadedChunks = serverTask.uploaded_chunks || 0;
+                    const lockedUploadPath = serverTask.upload_path || '';
+                    console.log('从分块继续上传:', uploadedChunks);
+                    activeTasks[taskId] = buildUploadTaskState(taskId, file, serverTask, lockedUploadPath);
+                    cacheUploadFileForResume(taskId, file).catch(error => {
+                        console.warn('继续上传时缓存文件失败:', error);
+                    });
+                    startUploadFromChunk(taskId, file, uploadedChunks, lockedUploadPath);
+                };
+
+                fileInput.click();
+            } catch (error) {
+                console.error('获取任务信息失败:', error);
+                showAlert('错误', '获取任务信息失败');
+            }
         }
         
         // 删除未完成任务
@@ -9590,6 +10437,7 @@ HTML_TEMPLATE = """
                     const data = await response.json();
 
                     if (data.success) {
+                        await removeCachedUploadFile(taskId);
                         showAlert('成功', '任务已删除');
                         setTimeout(checkIncompleteTasks, 500);
                     } else {
@@ -10111,7 +10959,10 @@ def index(subpath=''):
                                 continue
                             
                             # 保存到用户选择的路径，并保留完整文件夹结构
-                            filepath = os.path.join(target_upload_path, filename)
+                            success, filepath, path_error = safe_join_path(target_upload_path, filename)
+                            if not success:
+                                failed_files.append(f"{file.filename}: {path_error}")
+                                continue
                             success, error_msg = save_file_safely(file, filepath)
                             
                             if success:
@@ -10146,7 +10997,6 @@ def index(subpath=''):
     
     files = []
     total_size = 0
-    total_size_recursive = 0
     breadcrumbs = []
     all_folders = []
     if subpath:
@@ -10161,81 +11011,9 @@ def index(subpath=''):
     
     if os.path.exists(current_path):
         try:
-            items = os.listdir(current_path)
-            
-            for item in items:
-                try:
-                    # 检查该项目是否应被隐藏
-                    if should_hide_shared_item(item):
-                        continue
-                    
-                    item_path = os.path.join(current_path, item)
-                    
-                    if not os.access(item_path, os.R_OK):
-                        continue
-                    
-                    stat = os.stat(item_path)
-                    mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    if subpath:
-                        relative_path = os.path.join(subpath, item).replace('\\', '/')
-                    else:
-                        relative_path = item
-                    
-                    if os.path.isdir(item_path):
-                        # 文件夹，添加斜杠标记
-                        files.append({
-                            'name': item + '/',
-                            'display_name': item,
-                            'relative_path': relative_path,
-                            'size': '文件夹',
-                            'time': mtime,
-                            'is_folder': True,
-                            'is_empty_folder': False
-                        })
-                    else:
-                        # 文件
-                        size = stat.st_size
-                        total_size += size
-                        files.append({
-                            'name': item,
-                            'display_name': item,
-                            'relative_path': relative_path,
-                            'size': get_file_size(size),
-                            'time': mtime,
-                            'is_folder': False,
-                            'is_empty_folder': False
-                        })
-                except (OSError, PermissionError) as e:
-                    print(f"⚠️  无法访问: {item_path} - {e}")
-                    continue
-                    
+            files, total_size = get_directory_entries(current_path, subpath)
         except (OSError, PermissionError) as e:
-            print(f"⚠️  无法读取目录: {current_path} - {e}")
             flash(f'无法访问该目录：{e}', 'danger')
-    
-    def sort_key(item):
-        is_folder = item.get('is_folder', False)
-        name = item['name'].lower()
-        return (not is_folder, name)
-    files.sort(key=sort_key)
-    
-    try:
-        for root, dirs, filenames in os.walk(current_path):
-            if HIDE_SYSTEM_FOLDERS:
-                dirs[:] = [d for d in dirs if d.lower() not in HIDDEN_ITEMS]
-            
-            for filename in filenames:
-                try:
-                    if should_hide_shared_item(filename):
-                        continue
-                    file_path = os.path.join(root, filename)
-                    if os.access(file_path, os.R_OK):
-                        total_size_recursive += os.path.getsize(file_path)
-                except (OSError, PermissionError):
-                    continue
-    except (OSError, PermissionError):
-        pass
     
     try:
         all_folders.append({'path': '', 'name': '根目录'})
@@ -10272,12 +11050,19 @@ def index(subpath=''):
         initial_online_users = get_online_users_snapshot()
         initial_admin_state = get_admin_state_snapshot()
 
+    files_total_count = len(files)
+    initial_files = files[:BROWSE_PAGE_SIZE]
+
     return render_template_string(
         HTML_TEMPLATE, 
-        files=files, 
+        files=initial_files, 
         ip=get_local_ip(), 
         port=SERVER_PORT,
-        total_size=get_file_size(total_size_recursive),
+        total_size='计算中...',
+        current_folder_size=get_file_size(total_size),
+        files_total_count=files_total_count,
+        initial_loaded_count=len(initial_files),
+        browse_page_size=BROWSE_PAGE_SIZE,
         current_path=subpath,
         breadcrumbs=breadcrumbs,
         all_folders=all_folders,
@@ -10376,25 +11161,25 @@ def check_updates(subpath=''):
         # 获取文件列表信息
         items = []
         try:
-            for item in os.listdir(current_path):
-                if should_hide_shared_item(item):
-                    continue
-                
-                item_path = os.path.join(current_path, item)
-                if not os.access(item_path, os.R_OK):
-                    continue
-                
-                try:
-                    stat = os.stat(item_path)
-                    items.append({
-                        'name': item,
-                        'is_dir': os.path.isdir(item_path),
-                        'mtime': stat.st_mtime,
-                        'size': stat.st_size if not os.path.isdir(item_path) else 0
-                    })
-                except:
-                    continue
-        except:
+            with os.scandir(current_path) as entries:
+                for entry in entries:
+                    item = entry.name
+                    if should_hide_shared_item(item):
+                        continue
+                    if not os.access(entry.path, os.R_OK):
+                        continue
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        items.append({
+                            'name': item,
+                            'is_dir': is_dir,
+                            'mtime': stat.st_mtime,
+                            'size': 0 if is_dir else stat.st_size
+                        })
+                    except Exception:
+                        continue
+        except Exception:
             pass
         
         # 计算文件列表哈希，用于检测变化
@@ -10407,6 +11192,65 @@ def check_updates(subpath=''):
             'hash': hash_value,
             'count': len(items),
             'items': items
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/browse_page')
+@app.route('/api/browse_page/<path:subpath>')
+def get_browse_page(subpath=''):
+    """Return one page of directory items for lazy loading."""
+    try:
+        success, current_path, error = safe_join_path(UPLOAD_FOLDER, subpath)
+        if not success:
+            return jsonify({'success': False, 'message': error}), 403
+
+        if not os.path.exists(current_path):
+            return jsonify({'success': False, 'message': '路径不存在。'}), 404
+
+        try:
+            offset = max(0, int(request.args.get('offset', 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(request.args.get('limit', BROWSE_PAGE_SIZE) or BROWSE_PAGE_SIZE)
+        except (TypeError, ValueError):
+            limit = BROWSE_PAGE_SIZE
+        limit = max(1, min(limit, BROWSE_PAGE_SIZE))
+
+        items, _ = get_directory_entries(current_path, subpath)
+        sliced_items = items[offset:offset + limit]
+        next_offset = offset + len(sliced_items)
+
+        return jsonify({
+            'success': True,
+            'items': sliced_items,
+            'offset': offset,
+            'next_offset': next_offset,
+            'page_size': limit,
+            'total_count': len(items),
+            'has_more': next_offset < len(items)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/directory_size')
+@app.route('/api/directory_size/<path:subpath>')
+def get_directory_size(subpath=''):
+    """Calculate directory size asynchronously after first paint."""
+    try:
+        success, current_path, error = safe_join_path(UPLOAD_FOLDER, subpath)
+        if not success:
+            return jsonify({'success': False, 'message': error}), 403
+
+        if not os.path.exists(current_path):
+            return jsonify({'success': False, 'message': '路径不存在。'}), 404
+
+        total_size = calculate_directory_size_async(current_path)
+        return jsonify({
+            'success': True,
+            'size_bytes': total_size,
+            'size': get_file_size(total_size)
         })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -10689,7 +11533,7 @@ def download_folder(folder_name):
             
             # 返回文件（优化：固定mimetype，支持条件请求）
             zip_filename = os.path.basename(folder_name) + '.zip'
-            return send_file(
+            response = send_file(
                 temp_zip.name,
                 mimetype='application/zip',
                 as_attachment=True,
@@ -10697,6 +11541,8 @@ def download_folder(folder_name):
                 conditional=True,  # 支持条件请求
                 max_age=0  # 禁用缓存
             )
+            response.call_on_close(lambda: os.path.exists(temp_zip.name) and os.unlink(temp_zip.name))
+            return response
         except Exception as e:
             # 清理临时文件
             try:
@@ -10741,6 +11587,9 @@ def request_entity_too_large(error):
 @app.route('/api/upload_chunk', methods=['POST'])
 def upload_chunk():
     """分块上传文件"""
+    preserve_chunk_files = False
+    temp_filepath = None
+    effective_filename = ''
     try:
         task_id = request.form.get('task_id')
         chunk_index = int(request.form.get('chunk_index', 0))
@@ -10754,43 +11603,42 @@ def upload_chunk():
         
         # 安全化文件名
         filename = secure_filename(filename)
-        
-        if upload_path:
-            success, target_dir, error = safe_join_path(app.config['UPLOAD_FOLDER'], upload_path)
-            if not success:
-                return jsonify({'success': False, 'message': error}), 400
-            # 确保目标目录存在
-            os.makedirs(target_dir, exist_ok=True)
-            filepath = os.path.join(target_dir, filename)
-        else:
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        # 使用临时文件夹存储分块文件，避免在上传文件夹中产生小文件
-        temp_filepath = os.path.join(TEMP_FOLDER, f'{task_id}_{filename}.tmp')
+        if not filename:
+            return jsonify({'success': False, 'message': '文件名无效'}), 400
         
         with tasks_lock:
             if task_id not in tasks:
                 username = get_current_username()
+                normalized_upload_path = (upload_path or '').replace('\\', '/').strip('/')
                 
                 tasks[task_id] = {
                     'type': 'upload',
                     'status': 'running',
                     'filename': filename,
-                    'upload_path': (upload_path or '').replace('\\', '/').strip('/'),
+                    'upload_path': normalized_upload_path,
                     'total_chunks': total_chunks,
                     'uploaded_chunks': 0,
                     'created_at': datetime.now().isoformat(),
                     'ip': request.remote_addr,
                     'username': username
                 }
-            else:
-                uploaded_count = sum(1 for i in range(total_chunks) 
-                                    if os.path.exists(temp_filepath + f'.chunk{i}'))
-                tasks[task_id]['uploaded_chunks'] = uploaded_count
-                if upload_path is not None:
-                    tasks[task_id]['upload_path'] = (upload_path or '').replace('\\', '/').strip('/')
-                # 如果任务状态不是 running，也不要强制覆盖，允许保持 paused
             
             task = tasks[task_id]
+            effective_filename = task.get('filename') or filename
+            effective_upload_path = (task.get('upload_path') or '').replace('\\', '/').strip('/')
+            total_chunks = int(task.get('total_chunks') or total_chunks)
+
+            if effective_upload_path:
+                success, target_dir, error = safe_join_path(app.config['UPLOAD_FOLDER'], effective_upload_path)
+                if not success:
+                    return jsonify({'success': False, 'message': error}), 400
+                os.makedirs(target_dir, exist_ok=True)
+                filepath = os.path.join(target_dir, effective_filename)
+            else:
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], effective_filename)
+
+            # 使用临时文件夹存储分块文件，避免在上传文件夹中产生小文件
+            temp_filepath = os.path.join(TEMP_FOLDER, f'{task_id}_{effective_filename}.tmp')
             
             if task['status'] == 'paused':
                 return jsonify({'success': False, 'message': '任务已暂停。', 'paused': True}), 200
@@ -10851,6 +11699,12 @@ def upload_chunk():
                     
                 except Exception as merge_error:
                     # 合并失败，保留分块文件供重试
+                    preserve_chunk_files = True
+                    try:
+                        if temp_filepath and os.path.exists(temp_filepath):
+                            os.remove(temp_filepath)
+                    except Exception as partial_cleanup_error:
+                        print(f"[upload-chunk] partial temp cleanup failed: {partial_cleanup_error}")
                     print(f"[upload-chunk] merge failed: {merge_error}")
                     raise merge_error
                 
@@ -10886,13 +11740,13 @@ def upload_chunk():
                 save_tasks()
         
         try:
-            temp_filepath = os.path.join(TEMP_FOLDER, f'{task_id}_{filename}.tmp')
-            if os.path.exists(temp_filepath):
+            if temp_filepath and os.path.exists(temp_filepath):
                 os.remove(temp_filepath)
-            for i in range(total_chunks):
-                chunk_file = temp_filepath + f'.chunk{i}'
-                if os.path.exists(chunk_file):
-                    os.remove(chunk_file)
+            if not preserve_chunk_files and temp_filepath:
+                for i in range(total_chunks):
+                    chunk_file = temp_filepath + f'.chunk{i}'
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
         except Exception as cleanup_error:
             print(f"[upload-chunk] cleanup failed: {cleanup_error}")
         
@@ -11561,21 +12415,22 @@ def access_share(link_id):
 def batch_download():
     """批量下载选中的文件，打包为 ZIP 并尽量流式压缩。"""
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'success': False, 'message': '无效的请求数据。'}), 400
-        
-        paths = data.get('paths', [])
+        data = request.get_json(silent=True)
+        if isinstance(data, dict):
+            paths = data.get('paths', [])
+        else:
+            paths = request.form.getlist('paths')
+
         if not paths:
             return jsonify({'success': False, 'message': '请选择要下载的文件。'}), 400
-        
-        # 使用内存流进行ZIP压缩（避免大文件夹卡住）
-        memory_file = io.BytesIO()
+
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_zip.close()
         
         print(f"[batch-download] start: {len(paths)} items")
         
-        # 流式压缩
-        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # 使用临时文件流式压缩，避免大批量下载时浏览器拿 blob 占太多内存
+        with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
             file_count = 0
             for path in paths:
                 success, full_path, error = safe_join_path(app.config['UPLOAD_FOLDER'], path)
@@ -11620,23 +12475,30 @@ def batch_download():
                     print(f"  finished folder: {os.path.basename(path)} ({folder_file_count} files)")
         
         print(f"[batch-download] completed: {file_count} files")
-        
-        memory_file.seek(0)
-        
+
         # 返回ZIP文件
         zip_filename = f'批量下载_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-        
-        return send_file(
-            memory_file,
+
+        response = send_file(
+            temp_zip.name,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=zip_filename
+            download_name=zip_filename,
+            conditional=True,
+            max_age=0
         )
+        response.call_on_close(lambda: os.path.exists(temp_zip.name) and os.unlink(temp_zip.name))
+        return response
     
     except Exception as e:
         print(f"[batch-download] failed: {str(e)}")
         import traceback
         traceback.print_exc()
+        try:
+            if 'temp_zip' in locals() and os.path.exists(temp_zip.name):
+                os.unlink(temp_zip.name)
+        except Exception:
+            pass
         return jsonify({'success': False, 'message': f'批量下载失败: {str(e)}'}), 500
 
 # ==================== 文件预览功能 ====================
@@ -17370,8 +18232,10 @@ def main():
             app,
             host=host,
             port=port,
-            threads=24,
-            channel_timeout=1800,
+            threads=WAITRESS_THREADS,
+            connection_limit=WAITRESS_CONNECTION_LIMIT,
+            channel_timeout=WAITRESS_CHANNEL_TIMEOUT,
+            cleanup_interval=WAITRESS_CLEANUP_INTERVAL,
             max_request_body_size=21474836480,
             max_request_header_size=5242880,
             recv_bytes=262144,
