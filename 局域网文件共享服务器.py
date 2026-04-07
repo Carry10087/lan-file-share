@@ -25,6 +25,8 @@ import uuid
 import mimetypes
 import difflib
 import queue
+import copy
+import atexit
 from werkzeug.serving import make_server
 from werkzeug.wrappers import Response
 import configparser
@@ -206,10 +208,19 @@ FLASK_SESSION_COOKIE_NAME = 'lanfs_session'
 SECRET_KEY_FILE = os.path.join(BASE_PATH, '.flask_secret_key')
 ONLINE_PRESENCE_TTL_SECONDS = 45
 REALTIME_STREAM_INTERVAL_SECONDS = 2.0
+REALTIME_SHARED_SNAPSHOT_TTL_SECONDS = 1.0
+DIRECTORY_UPDATES_CACHE_TTL_SECONDS = 2.5
 WAITRESS_THREADS = 24
 WAITRESS_CONNECTION_LIMIT = 512
 WAITRESS_CHANNEL_TIMEOUT = 300
 WAITRESS_CLEANUP_INTERVAL = 30
+DOWNLOAD_WAIT_WARNING_BYTES = 300 * 1024 * 1024
+PREPARED_DOWNLOAD_CACHE_TTL_SECONDS = 180
+PREPARED_DOWNLOAD_FAILURE_TTL_SECONDS = 20
+PREPARED_DOWNLOAD_WAIT_TIMEOUT_SECONDS = 1800
+UPLOAD_PROGRESS_PERSIST_INTERVAL_SECONDS = 1.0
+TASKS_PERSIST_DEBOUNCE_SECONDS = 0.35
+TASKS_VIEW_CACHE_TTL_SECONDS = 0.75
 PASSWORD_MIN_LENGTH = 6
 PASSWORD_HASH_ITERATIONS = 200000
 ACCOUNT_KEY_PREFIX = 'user:'
@@ -250,6 +261,17 @@ online_users = {}  # {session_id: {'username': str, 'ip': str}}
 user_lock = threading.Lock()
 current_activities = []  # [{'username': str, 'action': str, 'filename': str, 'timestamp': float}]
 activity_lock = threading.Lock()
+shared_realtime_snapshot_lock = threading.Lock()
+shared_realtime_snapshot_cache = {
+    'generated_at': 0.0,
+    'payload': None
+}
+directory_updates_cache_lock = threading.Lock()
+directory_updates_cache = {}
+download_state_lock = threading.Lock()
+active_download_requests = 0
+prepared_download_tasks_lock = threading.Lock()
+prepared_download_tasks = {}
 
 # 注册信息存储（使用配置文件中的路径）
 registration_lock = threading.Lock()
@@ -496,7 +518,95 @@ print(f"[startup] loaded {admin_count} admins")
 
 # 任务管理系统（使用配置文件中的路径）
 tasks = {}  # {task_id: {'type': 'upload'|'download', 'status': 'running'|'paused'|'completed'|'error', ...}}
-tasks_lock = threading.Lock()
+tasks_lock = threading.RLock()
+upload_task_locks = {}
+upload_task_locks_lock = threading.Lock()
+task_view_cache = {}
+task_view_cache_lock = threading.Lock()
+tasks_persist_event = threading.Event()
+tasks_dirty = False
+tasks_revision = 0
+tasks_last_saved_revision = 0
+
+def get_upload_task_lock(task_id):
+    """Return a per-task lock for upload chunk coordination."""
+    with upload_task_locks_lock:
+        lock = upload_task_locks.get(task_id)
+        if lock is None:
+            lock = threading.Lock()
+            upload_task_locks[task_id] = lock
+        return lock
+
+def remove_upload_task_lock(task_id):
+    """Remove a per-task upload lock when the task is gone."""
+    with upload_task_locks_lock:
+        upload_task_locks.pop(task_id, None)
+
+def count_existing_upload_chunks(temp_filepath, total_chunks):
+    """Count already uploaded chunk files for one task."""
+    total = 0
+    for index in range(total_chunks):
+        if os.path.exists(temp_filepath + f'.chunk{index}'):
+            total += 1
+    return total
+
+def invalidate_task_view_cache():
+    """Drop cached task responses."""
+    with task_view_cache_lock:
+        task_view_cache.clear()
+
+def _write_tasks_snapshot(snapshot):
+    """Persist a task snapshot to disk."""
+    try:
+        tasks_dir = os.path.dirname(TASKS_FILE)
+        if tasks_dir:
+            os.makedirs(tasks_dir, exist_ok=True)
+        temp_path = TASKS_FILE + '.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, TASKS_FILE)
+        return True
+    except Exception as e:
+        print(f"⚠️  保存任务列表失败: {e}")
+        return False
+
+def flush_tasks_to_disk(force=False):
+    """Flush dirty task state to disk, optionally synchronously."""
+    global tasks_dirty, tasks_last_saved_revision
+
+    while True:
+        with tasks_lock:
+            if not tasks_dirty:
+                tasks_persist_event.clear()
+                return True
+            snapshot = copy.deepcopy(tasks)
+            target_revision = tasks_revision
+
+        success = _write_tasks_snapshot(snapshot)
+
+        with tasks_lock:
+            if success:
+                tasks_last_saved_revision = max(tasks_last_saved_revision, target_revision)
+                if tasks_revision == target_revision:
+                    tasks_dirty = False
+                    tasks_persist_event.clear()
+                    return True
+            else:
+                tasks_dirty = True
+                tasks_persist_event.set()
+                if force:
+                    return False
+
+        if force:
+            return False
+        time.sleep(TASKS_PERSIST_DEBOUNCE_SECONDS)
+
+def background_tasks_persist_loop():
+    """Persist task state in the background with debounce."""
+    while True:
+        tasks_persist_event.wait()
+        time.sleep(TASKS_PERSIST_DEBOUNCE_SECONDS)
+        flush_tasks_to_disk(force=False)
 
 def load_tasks():
     """加载任务列表"""
@@ -510,16 +620,23 @@ def load_tasks():
     return {}
 
 def save_tasks():
-    """保存任务列表"""
-    try:
-        with open(TASKS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️  保存任务列表失败: {e}")
+    """Schedule task state persistence and invalidate cached task views."""
+    global tasks_dirty, tasks_revision
+    with tasks_lock:
+        tasks_dirty = True
+        tasks_revision += 1
+    invalidate_task_view_cache()
+    tasks_persist_event.set()
+    return True
 
 # 加载任务列表
 tasks = load_tasks()
 print(f"[startup] loaded {len(tasks)} tasks")
+
+tasks_persist_thread = threading.Thread(target=background_tasks_persist_loop, daemon=True)
+tasks_persist_thread.start()
+print("[startup] task persistence thread started")
+atexit.register(lambda: flush_tasks_to_disk(force=True))
 
 # 分享链接管理系统
 SHARE_LINKS_FILE = os.path.join(BASE_PATH, 'share_links.json')
@@ -583,6 +700,7 @@ def cleanup_old_tasks():
                 
                 # 删除任务
                 del tasks[task_id]
+                remove_upload_task_lock(task_id)
                 deleted_count += 1
             except:
                 pass
@@ -590,6 +708,39 @@ def cleanup_old_tasks():
         if deleted_count > 0:
             print(f"[cleanup] removed {deleted_count} expired tasks")
             save_tasks()
+
+def build_tasks_payload_for_client(client_id, include_completed=False):
+    """Build a cached task payload for one client."""
+    cache_key = (str(client_id or ''), bool(include_completed))
+    now = time.time()
+    with tasks_lock:
+        current_revision = tasks_revision
+
+    with task_view_cache_lock:
+        cached = task_view_cache.get(cache_key)
+        if cached:
+            cached_revision = int(cached.get('revision') or 0)
+            generated_at = float(cached.get('generated_at') or 0.0)
+            if cached_revision == current_revision and (now - generated_at) <= TASKS_VIEW_CACHE_TTL_SECONDS:
+                return copy.deepcopy(cached['payload'])
+
+    user_tasks = {}
+    with tasks_lock:
+        for tid, task in tasks.items():
+            if task.get('ip') != client_id:
+                continue
+            if not include_completed and task.get('status') == 'completed':
+                continue
+            user_tasks[tid] = copy.deepcopy(task)
+
+    payload = {'success': True, 'tasks': user_tasks}
+    with task_view_cache_lock:
+        task_view_cache[cache_key] = {
+            'revision': current_revision,
+            'generated_at': now,
+            'payload': payload
+        }
+    return copy.deepcopy(payload)
 
 def periodic_cleanup():
     """Periodically clean stale background state."""
@@ -655,6 +806,13 @@ def _prune_expired_online_users_locked(now=None):
     ]
     for presence_id in expired_keys:
         online_users.pop(presence_id, None)
+    return bool(expired_keys)
+
+def invalidate_shared_realtime_snapshot():
+    """Mark the shared realtime snapshot cache as stale."""
+    with shared_realtime_snapshot_lock:
+        shared_realtime_snapshot_cache['generated_at'] = 0.0
+        shared_realtime_snapshot_cache['payload'] = None
 
 def sync_current_online_presence():
     """Docstring."""
@@ -665,13 +823,23 @@ def sync_current_online_presence():
         return None
 
     now = time.time()
+    changed = False
     with user_lock:
-        _prune_expired_online_users_locked(now)
+        changed = _prune_expired_online_users_locked(now)
+        existing_info = online_users.get(presence_id)
+        if (
+            not existing_info
+            or existing_info.get('username') != username
+            or existing_info.get('ip') != client_ip
+        ):
+            changed = True
         online_users[presence_id] = {
             'username': username,
             'ip': client_ip,
             'last_seen': now
         }
+    if changed:
+        invalidate_shared_realtime_snapshot()
     return presence_id
 
 @app.route('/login', methods=['POST'])
@@ -772,23 +940,15 @@ def logout():
     presence_id = get_page_session_id()
     with user_lock:
         online_users.pop(presence_id, None)
+    invalidate_shared_realtime_snapshot()
     return jsonify({'success': True, 'message': '已退出登录。'})
 
 @app.route('/get_online_users', methods=['GET'])
 def get_online_users():
     """获取在线用户列表（去重，每个用户只显示一次）"""
     sync_current_online_presence()
-    with user_lock:
-        _prune_expired_online_users_locked()
-        unique_users = {}
-        for info in online_users.values():
-            username = info['username']
-            if username not in unique_users:
-                unique_users[username] = {
-                    'username': username,
-                    'ip': info['ip']
-                }
-        users = list(unique_users.values())
+    shared_snapshot = get_shared_realtime_snapshot()
+    users = shared_snapshot.get('online_users', [])
     return jsonify({'count': len(users), 'users': users})
 
 @app.route('/offline', methods=['POST'])
@@ -798,6 +958,7 @@ def user_offline():
     with user_lock:
         if presence_id in online_users:
             del online_users[presence_id]
+            invalidate_shared_realtime_snapshot()
             return jsonify({'success': True, 'message': '已下线。'})
     return jsonify({'success': False, 'message': '未找到在线会话。'}), 404
 
@@ -948,10 +1109,28 @@ def manual_set_admin(username):
 def get_activities():
     """Docstring."""
     sync_current_online_presence()
+    shared_snapshot = get_shared_realtime_snapshot()
     return jsonify({
-        'activities': get_recent_activities_snapshot(20),
-        'active_tasks': get_active_tasks_snapshot()
+        'activities': shared_snapshot.get('activities', []),
+        'active_tasks': shared_snapshot.get('active_tasks', [])
     })
+
+def build_homepage_realtime_payload():
+    """Build the lightweight homepage realtime snapshot payload."""
+    sync_current_online_presence()
+    shared_snapshot = get_shared_realtime_snapshot()
+    return {
+        'current_username': get_current_username(),
+        'online_users': shared_snapshot.get('online_users', []),
+        'activities': (shared_snapshot.get('activities', []) or [])[:10],
+        'active_tasks': shared_snapshot.get('active_tasks', []),
+        'admin': get_admin_state_snapshot()
+    }
+
+@app.route('/api/realtime_snapshot', methods=['GET'])
+def realtime_snapshot():
+    """Return a single homepage realtime snapshot for lightweight polling."""
+    return jsonify(build_homepage_realtime_payload())
 
 @app.route('/api/realtime_stream', methods=['GET'])
 def realtime_stream():
@@ -960,14 +1139,7 @@ def realtime_stream():
         last_payload = None
         while True:
             try:
-                sync_current_online_presence()
-                payload = {
-                    'current_username': get_current_username(),
-                    'online_users': get_online_users_snapshot(),
-                    'activities': get_recent_activities_snapshot(10),
-                    'active_tasks': get_active_tasks_snapshot(),
-                    'admin': get_admin_state_snapshot()
-                }
+                payload = build_homepage_realtime_payload()
                 serialized = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
                 if serialized != last_payload:
                     yield f"event: snapshot\ndata: {serialized}\n\n"
@@ -998,6 +1170,7 @@ def add_activity(username, action, filename):
         })
         if len(current_activities) > 100:
             current_activities.pop(0)
+    invalidate_shared_realtime_snapshot()
 
 def normalize_activity_action(action):
     """只保留前端需要展示的标准动态类型。"""
@@ -1041,6 +1214,336 @@ def get_recent_activities_snapshot(limit=10):
             if len(normalized_recent) >= limit:
                 break
     return normalized_recent
+
+def build_shared_realtime_snapshot():
+    """Build the shared realtime payload used by multiple clients."""
+    return {
+        'online_users': get_online_users_snapshot(),
+        'activities': get_recent_activities_snapshot(20),
+        'active_tasks': get_active_tasks_snapshot()
+    }
+
+def get_shared_realtime_snapshot(force=False):
+    """Return a short-lived shared realtime snapshot to reduce duplicate work."""
+    current_time = time.time()
+    with shared_realtime_snapshot_lock:
+        cached_payload = shared_realtime_snapshot_cache.get('payload')
+        generated_at = float(shared_realtime_snapshot_cache.get('generated_at') or 0.0)
+        if (
+            not force
+            and cached_payload is not None
+            and (current_time - generated_at) < REALTIME_SHARED_SNAPSHOT_TTL_SECONDS
+        ):
+            return cached_payload
+
+    payload = build_shared_realtime_snapshot()
+
+    with shared_realtime_snapshot_lock:
+        shared_realtime_snapshot_cache['generated_at'] = current_time
+        shared_realtime_snapshot_cache['payload'] = payload
+
+    return payload
+
+def get_directory_updates_payload(current_path, force=False):
+    """Cache expensive directory update checks for a short time across users."""
+    current_time = time.time()
+    normalized_path = os.path.normcase(os.path.abspath(current_path))
+
+    with directory_updates_cache_lock:
+        cached_entry = directory_updates_cache.get(normalized_path)
+        if (
+            not force
+            and cached_entry
+            and (current_time - float(cached_entry.get('generated_at') or 0.0)) < DIRECTORY_UPDATES_CACHE_TTL_SECONDS
+        ):
+            return cached_entry['payload']
+
+    items = []
+    try:
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                item = entry.name
+                if should_hide_shared_item(item):
+                    continue
+                if not os.access(entry.path, os.R_OK):
+                    continue
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    items.append({
+                        'name': item,
+                        'is_dir': is_dir,
+                        'mtime': stat.st_mtime,
+                        'size': 0 if is_dir else stat.st_size
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    import hashlib
+    items_str = '|'.join(sorted([f"{item['name']}_{item['mtime']}_{item['size']}" for item in items]))
+    payload = {
+        'success': True,
+        'hash': hashlib.md5(items_str.encode()).hexdigest(),
+        'count': len(items),
+        'items': items
+    }
+
+    with directory_updates_cache_lock:
+        directory_updates_cache[normalized_path] = {
+            'generated_at': current_time,
+            'payload': payload
+        }
+        if len(directory_updates_cache) > 128:
+            oldest_key = min(
+                directory_updates_cache,
+                key=lambda key: float(directory_updates_cache[key].get('generated_at') or 0.0)
+            )
+            directory_updates_cache.pop(oldest_key, None)
+
+    return payload
+
+def begin_active_download_request():
+    """Increase the active download counter and return the current count."""
+    global active_download_requests
+    with download_state_lock:
+        active_download_requests += 1
+        return active_download_requests
+
+def finish_active_download_request():
+    """Decrease the active download counter safely."""
+    global active_download_requests
+    with download_state_lock:
+        active_download_requests = max(0, active_download_requests - 1)
+        return active_download_requests
+
+def get_active_download_request_count():
+    """Return the current number of active download responses."""
+    with download_state_lock:
+        return int(active_download_requests)
+
+def normalize_download_task_path(relative_path):
+    """Normalize a shared relative path for download task keys."""
+    return str(relative_path or '').replace('\\', '/').strip().strip('/')
+
+def build_folder_download_task_key(folder_name):
+    """Build a stable task key for a folder download."""
+    normalized = normalize_download_task_path(folder_name)
+    return f'folder:{normalized}'
+
+def build_batch_download_task_key(paths):
+    """Build a stable task key for a batch download selection."""
+    normalized_paths = sorted(
+        normalized
+        for normalized in (normalize_download_task_path(path) for path in (paths or []))
+        if normalized
+    )
+    digest = hashlib.md5('\n'.join(normalized_paths).encode('utf-8')).hexdigest()
+    return f'batch:{digest}'
+
+def cleanup_prepared_download_tasks():
+    """Remove expired prepared download packages and failed task records."""
+    now = time.time()
+    stale_tasks = []
+
+    with prepared_download_tasks_lock:
+        for task_key, task in list(prepared_download_tasks.items()):
+            status = str(task.get('status') or '')
+            updated_at = float(task.get('updated_at') or 0.0)
+            expires_at = float(task.get('expires_at') or 0.0)
+            active_streams = int(task.get('active_streams') or 0)
+
+            should_remove = False
+            if status == 'ready':
+                temp_path = task.get('temp_path')
+                if not temp_path or not os.path.exists(temp_path):
+                    should_remove = True
+                elif expires_at and now >= expires_at and active_streams <= 0:
+                    should_remove = True
+            elif status == 'failed':
+                if now - updated_at >= PREPARED_DOWNLOAD_FAILURE_TTL_SECONDS:
+                    should_remove = True
+            elif status == 'preparing':
+                if now - updated_at >= PREPARED_DOWNLOAD_WAIT_TIMEOUT_SECONDS and active_streams <= 0:
+                    should_remove = True
+
+            if should_remove:
+                stale_tasks.append(prepared_download_tasks.pop(task_key, None))
+
+    for task in stale_tasks:
+        temp_path = task.get('temp_path') if isinstance(task, dict) else None
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+def get_prepared_download_task_snapshot(task_key):
+    """Return a safe snapshot of a prepared download task."""
+    cleanup_prepared_download_tasks()
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if not task:
+            return None
+        return {
+            'key': task.get('key'),
+            'kind': task.get('kind'),
+            'display_name': task.get('display_name'),
+            'status': task.get('status'),
+            'created_at': task.get('created_at'),
+            'updated_at': task.get('updated_at'),
+            'expires_at': task.get('expires_at'),
+            'temp_path': task.get('temp_path'),
+            'error': task.get('error'),
+            'active_streams': int(task.get('active_streams') or 0),
+            'request_count': int(task.get('request_count') or 0)
+        }
+
+def get_or_create_prepared_download_task(task_key, kind, display_name):
+    """Get an existing prepared download task or create a new owner task."""
+    cleanup_prepared_download_tasks()
+    now = time.time()
+
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if task:
+            status = str(task.get('status') or '')
+            temp_path = task.get('temp_path')
+
+            if status == 'ready' and temp_path and os.path.exists(temp_path):
+                task['updated_at'] = now
+                task['expires_at'] = now + PREPARED_DOWNLOAD_CACHE_TTL_SECONDS
+                task['request_count'] = int(task.get('request_count') or 0) + 1
+                return task, False
+
+            if status == 'preparing':
+                task['updated_at'] = now
+                task['request_count'] = int(task.get('request_count') or 0) + 1
+                return task, False
+
+            prepared_download_tasks.pop(task_key, None)
+
+        task = {
+            'key': task_key,
+            'kind': kind,
+            'display_name': display_name,
+            'status': 'preparing',
+            'created_at': now,
+            'updated_at': now,
+            'expires_at': 0.0,
+            'temp_path': None,
+            'error': '',
+            'event': threading.Event(),
+            'active_streams': 0,
+            'request_count': 1
+        }
+        prepared_download_tasks[task_key] = task
+        return task, True
+
+def mark_prepared_download_task_ready(task_key, temp_path):
+    """Mark a prepared download task as ready for reuse."""
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if not task:
+            return
+        task['status'] = 'ready'
+        task['temp_path'] = temp_path
+        task['error'] = ''
+        task['updated_at'] = time.time()
+        task['expires_at'] = task['updated_at'] + PREPARED_DOWNLOAD_CACHE_TTL_SECONDS
+        task['event'].set()
+
+def mark_prepared_download_task_failed(task_key, error_message, temp_path=None):
+    """Mark a prepared download task as failed and wake any waiters."""
+    if temp_path and os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if not task:
+            return
+        task['status'] = 'failed'
+        task['temp_path'] = None
+        task['error'] = str(error_message or '下载包准备失败，请重试。')
+        task['updated_at'] = time.time()
+        task['expires_at'] = task['updated_at'] + PREPARED_DOWNLOAD_FAILURE_TTL_SECONDS
+        task['event'].set()
+
+def wait_for_prepared_download_task(task_key, timeout=None):
+    """Wait until a prepared download task completes."""
+    if timeout is None:
+        timeout = PREPARED_DOWNLOAD_WAIT_TIMEOUT_SECONDS
+
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        event = task.get('event') if task else None
+
+    if not event:
+        return False
+
+    waited = event.wait(timeout)
+    cleanup_prepared_download_tasks()
+    return waited
+
+def begin_prepared_download_stream(task_key):
+    """Register an outgoing stream against a prepared download cache entry."""
+    cleanup_prepared_download_tasks()
+    now = time.time()
+
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if not task:
+            return None
+        if task.get('status') != 'ready':
+            return None
+        temp_path = task.get('temp_path')
+        if not temp_path or not os.path.exists(temp_path):
+            task['status'] = 'failed'
+            task['error'] = '下载包缓存已失效，请重试。'
+            task['updated_at'] = now
+            task['expires_at'] = now + PREPARED_DOWNLOAD_FAILURE_TTL_SECONDS
+            task['event'].set()
+            return None
+
+        task['active_streams'] = int(task.get('active_streams') or 0) + 1
+        task['updated_at'] = now
+        task['expires_at'] = now + PREPARED_DOWNLOAD_CACHE_TTL_SECONDS
+        return temp_path
+
+def finish_prepared_download_stream(task_key):
+    """Release a prepared download stream reference."""
+    with prepared_download_tasks_lock:
+        task = prepared_download_tasks.get(task_key)
+        if task:
+            task['active_streams'] = max(0, int(task.get('active_streams') or 0) - 1)
+            task['updated_at'] = time.time()
+    cleanup_prepared_download_tasks()
+
+def build_prepared_download_response(task_key, download_name):
+    """Create a download response from a prepared ZIP cache entry."""
+    temp_path = begin_prepared_download_stream(task_key)
+    if not temp_path:
+        raise FileNotFoundError('下载包缓存不存在或已失效，请重试。')
+
+    response = send_file(
+        temp_path,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=download_name,
+        conditional=True,
+        max_age=0
+    )
+
+    def finalize_prepared_download():
+        finish_prepared_download_stream(task_key)
+        finish_active_download_request()
+
+    response.call_on_close(finalize_prepared_download)
+    return response
 
 def get_active_tasks_snapshot():
     """Docstring."""
@@ -5609,6 +6112,26 @@ HTML_TEMPLATE = """
             font-size: 11px;
             margin-top: 4px;
         }
+
+        .activity-main {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: baseline;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .activity-action-word {
+            color: rgba(255, 255, 255, 0.92);
+            font-weight: 600;
+        }
+
+        .activity-file-name {
+            color: rgba(255, 255, 255, 0.88);
+            word-break: break-all;
+            overflow-wrap: anywhere;
+        }
         
         .active-task {
             animation: activeTaskPulse 2s ease-in-out infinite;
@@ -6297,12 +6820,13 @@ HTML_TEMPLATE = """
                                style="width: 100%; 
                                       padding: 12px 45px 12px 15px; 
                                       border-radius: 12px; 
-                                      border: 2px solid rgba(16, 185, 129, 0.3); 
+                                      border: 2px solid rgba(255, 255, 255, 0.18); 
                                       background: rgba(255, 255, 255, 0.1); 
                                       color: white; 
                                       font-size: 14px;
                                       backdrop-filter: blur(10px);
-                                      box-sizing: border-box;">
+                                      box-sizing: border-box;
+                                      outline: none;">
                         <button id="clearSearchBtn" 
                                 onclick="clearSearch()" 
                                 style="position: absolute; 
@@ -7757,9 +8281,6 @@ HTML_TEMPLATE = """
         
         // 检查管理员权限
         async function checkAdminPermission(forceRefresh = false) {
-            if (!forceRefresh && realtimeEventSource && realtimeEventSource.readyState === EventSource.OPEN) {
-                return;
-            }
             try {
                 const response = await fetchWithPresence('/api/check_admin');
                 const data = await response.json();
@@ -7888,17 +8409,6 @@ HTML_TEMPLATE = """
             
             return false;
         }
-        
-        // 页面加载后先检查一次管理员权限
-        checkAdminPermission();
-        
-        // 定期刷新管理员申请和权限状态
-        setInterval(() => {
-            if (isHost) {
-                updateAdminRequests();
-            }
-            checkAdminPermission();
-        }, 5000);
         
         // ========== 鼠标光晕跟随效果 ==========
         const mouseGlow = document.getElementById('mouseGlow');
@@ -8284,8 +8794,20 @@ HTML_TEMPLATE = """
                     div.className = `activity-item ${meta.className}`;
 
                     const timeAgo = formatTimeAgo(activity.timestamp);
-                    const fileInfo = activity.filename ? ` ${escapeHtml(activity.filename)}` : '';
-                    div.innerHTML = `${meta.icon} <strong>${escapeHtml(activity.username || '匿名用户')}</strong> ${escapeHtml(activity.action || '动态')}${fileInfo}<div class="activity-time">${escapeHtml(timeAgo)}</div>`;
+                    const safeUsername = escapeHtml(activity.username || '匿名用户');
+                    const safeAction = escapeHtml(activity.action || '动态');
+                    const safeFilename = escapeHtml(activity.filename || '');
+                    const fileInfo = safeFilename
+                        ? `<span class="activity-file-name" title="${safeFilename}">${safeFilename}</span>`
+                        : '';
+                    div.innerHTML = `
+                        <div class="activity-main">
+                            <strong>${safeUsername}</strong>
+                            <span class="activity-action-word">${safeAction}</span>
+                            ${fileInfo}
+                        </div>
+                        <div class="activity-time">${escapeHtml(timeAgo)}</div>
+                    `;
                     container.appendChild(div);
                     renderedItems += 1;
                 });
@@ -8302,22 +8824,28 @@ HTML_TEMPLATE = """
             const diff = now - timestamp;
             if (diff < 60) return '刚刚';
             if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
-            if (diff < 86400) return Math.floor(diff / 3600) + ' Сʱǰ';
+            if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
             return Math.floor(diff / 86400) + ' 天前';
         }
 
-        let pollingStarted = false;
-        let onlineUsersPollTimer = null;
-        let activitiesPollTimer = null;
-        let realtimeFallbackStarted = false;
-        let realtimeFallbackOnlineTimer = null;
-        let realtimeFallbackActivitiesTimer = null;
-        let realtimeFallbackAdminTimer = null;
+        let realtimePollingTimer = null;
+        let realtimeRequestInFlight = false;
+        let realtimeRefreshPending = false;
+        let realtimeLastSnapshotAt = 0;
+        let tasksRequestInFlight = false;
+        let tasksRefreshPending = false;
+        let tasksLastFetchedAt = 0;
+        const realtimePollingIntervalMs = 4000;
+        const realtimePollingJitterMs = 800;
+        const tasksRefreshMinIntervalMs = 1200;
+        const backgroundTaskCleanupIntervalMs = 20000;
+        const completedTaskCleanupGraceMs = 10000;
 
         function handleRealtimeSnapshot(payload) {
             if (!payload || typeof payload !== 'object') {
                 return;
             }
+            realtimeLastSnapshotAt = Date.now();
             if (payload.current_username) {
                 setCurrentUserName(payload.current_username);
             }
@@ -8329,49 +8857,11 @@ HTML_TEMPLATE = """
             renderActivities(payload.activities || [], payload.active_tasks || []);
         }
 
-        function clearRealtimeFallback() {
-            if (realtimeFallbackOnlineTimer) {
-                clearInterval(realtimeFallbackOnlineTimer);
-                realtimeFallbackOnlineTimer = null;
-            }
-            if (realtimeFallbackActivitiesTimer) {
-                clearInterval(realtimeFallbackActivitiesTimer);
-                realtimeFallbackActivitiesTimer = null;
-            }
-            if (realtimeFallbackAdminTimer) {
-                clearInterval(realtimeFallbackAdminTimer);
-                realtimeFallbackAdminTimer = null;
-            }
-            realtimeFallbackStarted = false;
-        }
-
-        function startPollingFallback() {
-            if (realtimeFallbackStarted) {
-                return;
-            }
-            realtimeFallbackStarted = true;
-            updateOnlineUsers();
-            updateActivities();
-            checkAdminPermission(true);
-            realtimeFallbackOnlineTimer = setInterval(updateOnlineUsers, 4000);
-            realtimeFallbackActivitiesTimer = setInterval(updateActivities, 2500);
-            realtimeFallbackAdminTimer = setInterval(() => checkAdminPermission(true), 12000);
-        }
-
-        function scheduleRealtimeReconnect() {
-            if (realtimeReconnectTimer) {
-                return;
-            }
-            realtimeReconnectTimer = setTimeout(() => {
-                realtimeReconnectTimer = null;
-                if (document.hidden) {
-                    return;
-                }
-                startRealtimeUpdates();
-            }, 3000);
-        }
-
         function stopRealtimeStream() {
+            if (realtimePollingTimer) {
+                clearTimeout(realtimePollingTimer);
+                realtimePollingTimer = null;
+            }
             if (realtimeEventSource) {
                 realtimeEventSource.close();
                 realtimeEventSource = null;
@@ -8382,73 +8872,58 @@ HTML_TEMPLATE = """
             }
         }
 
-        function startRealtimeStream() {
+        function scheduleRealtimePoll(delay = realtimePollingIntervalMs) {
             if (document.hidden) {
                 return;
             }
-            if (!window.EventSource) {
-                startPollingFallback();
+            if (realtimePollingTimer) {
+                clearTimeout(realtimePollingTimer);
+            }
+            const jitter = Math.floor(Math.random() * realtimePollingJitterMs);
+            realtimePollingTimer = setTimeout(() => {
+                realtimePollingTimer = null;
+                fetchRealtimeSnapshot();
+            }, Math.max(500, delay + jitter));
+        }
+
+        async function fetchRealtimeSnapshot(forceRefresh = false) {
+            if (document.hidden) {
                 return;
             }
-            if (realtimeEventSource) {
+            if (realtimeRequestInFlight) {
+                if (forceRefresh) {
+                    realtimeRefreshPending = true;
+                }
                 return;
             }
 
-            clearRealtimeFallback();
-
-            const streamUrl = `/api/realtime_stream?page_session_id=${encodeURIComponent(pageSessionId)}`;
-            realtimeEventSource = new EventSource(streamUrl);
-
-            realtimeEventSource.onopen = function() {
-                if (realtimeReconnectTimer) {
-                    clearTimeout(realtimeReconnectTimer);
-                    realtimeReconnectTimer = null;
+            realtimeRequestInFlight = true;
+            try {
+                const response = await fetchWithPresence('/api/realtime_snapshot');
+                const data = await response.json();
+                handleRealtimeSnapshot(data);
+            } catch (error) {
+                console.error('获取实时快照失败:', error);
+            } finally {
+                realtimeRequestInFlight = false;
+                if (realtimeRefreshPending) {
+                    realtimeRefreshPending = false;
+                    fetchRealtimeSnapshot(true);
+                    return;
                 }
-            };
+                scheduleRealtimePoll();
+            }
+        }
 
-            realtimeEventSource.addEventListener('snapshot', function(event) {
-                try {
-                    handleRealtimeSnapshot(JSON.parse(event.data || '{}'));
-                } catch (error) {
-                    console.error('实时动态快照解析失败:', error);
-                }
-            });
-
-            realtimeEventSource.onerror = function() {
-                if (realtimeEventSource) {
-                    realtimeEventSource.close();
-                    realtimeEventSource = null;
-                }
-                startPollingFallback();
-                scheduleRealtimeReconnect();
-            };
+        function startRealtimeStream() {
+            stopRealtimeStream();
+            fetchRealtimeSnapshot(true);
         }
 
         function startRealtimeUpdates() {
-            updateOnlineUsers();
-            updateActivities();
-            checkAdminPermission(true);
-            if (window.EventSource) {
-                startRealtimeStream();
-                return;
-            }
-            startPollingFallback();
+            startRealtimeStream();
         }
         
-        // 启动轮询
-        function startPolling() {
-            if (pollingStarted) {
-                return;
-            }
-            pollingStarted = true;
-            updateOnlineUsers();
-            updateActivities();
-            onlineUsersPollTimer = setInterval(updateOnlineUsers, 3000);  // 每 3 秒刷新一次在线用户
-            activitiesPollTimer = setInterval(updateActivities, 3000);    // SSE 失败后再用低频轮询兜底
-        }
-        
-        // 如果已登录，启动轮询
-        {% if session.get('username') %}
         startRealtimeUpdates();
         
         // 监听浏览器关闭事件，发送离线通知
@@ -8463,12 +8938,10 @@ HTML_TEMPLATE = """
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) {
                 stopRealtimeStream();
-                clearRealtimeFallback();
             } else {
                 startRealtimeUpdates();
             }
         });
-        {% endif %}
         
         // 文件夹折叠/展开功能
         function toggleFolder(element) {
@@ -8663,6 +9136,7 @@ HTML_TEMPLATE = """
             document.getElementById('progressOverlay').style.display = 'none';
             document.getElementById('progressContainer').style.display = 'none';
             currentProgressTaskId = null;
+            clearDownloadNoticeTimers();
         }
         
         // 更新进度条
@@ -9172,9 +9646,29 @@ HTML_TEMPLATE = """
                 showAlert('⚠️ 提示', '请先选择要下载的项目');
                 return;
             }
+
+            const batchKey = paths
+                .map(path => String(path || '').trim())
+                .filter(path => path.length > 0)
+                .sort()
+                .join('\\n');
+            const now = Date.now();
+            if (batchDownloadLock && batchDownloadLock.key === batchKey && batchDownloadLock.expiresAt > now) {
+                showProgress('📦 批量下载已在准备中...');
+                updateProgress(24, '这批文件的打包请求已经提交，正在等待服务器处理，请勿重复点击。');
+                setTimeout(() => {
+                    hideProgress();
+                }, 2200);
+                return;
+            }
             
             // 显示提示
             const pathsCount = paths.length;
+            const lockDurationMs = Math.min(30000, 8000 + (pathsCount * 450));
+            batchDownloadLock = {
+                key: batchKey,
+                expiresAt: now + lockDurationMs
+            };
             showProgress('📦 正在打包文件...');
             updateProgress(10, `正在准备打包 ${pathsCount} 个项目，请勿关闭或刷新页面...`);
             
@@ -9225,6 +9719,9 @@ HTML_TEMPLATE = """
                     cancelBatchSelection();
                     if (form.parentNode) {
                         form.parentNode.removeChild(form);
+                    }
+                    if (batchDownloadLock && batchDownloadLock.key === batchKey) {
+                        batchDownloadLock = null;
                     }
                     // iframe 稍后再移除，避免浏览器还在处理下载时被提前清掉。
                     setTimeout(() => {
@@ -9349,20 +9846,235 @@ HTML_TEMPLATE = """
             cancelBtn.addEventListener('click', handleCancel);
         }
         
-        // 为所有下载按钮添加进度条
-        document.querySelectorAll('.btn-download').forEach(function(btn) {
-            btn.addEventListener('click', function(e) {
-                const href = this.getAttribute('href') || '';
+        let downloadNoticeTimers = [];
+        let managedDownloadLocks = new Map();
+        let batchDownloadLock = null;
 
-                // 如果是文件夹下载，显示特殊提示
-                if (href.includes('/download_folder/')) {
-                    // 文件夹打包可能持续较久，这里直接交给浏览器原生下载，
-                    // 避免像旧逻辑那样 5 秒后提前移除 iframe 导致下载中断。
-                    return;
-                } else {
-                    // 普通文件下载不显示进度条，直接开始下载
-                    // 让浏览器直接处理下载
+        function clearDownloadNoticeTimers() {
+            downloadNoticeTimers.forEach(timerId => clearTimeout(timerId));
+            downloadNoticeTimers = [];
+        }
+
+        function cleanupManagedDownloadLocks() {
+            const now = Date.now();
+            managedDownloadLocks.forEach((value, key) => {
+                if (!value || value.expiresAt <= now) {
+                    managedDownloadLocks.delete(key);
+                    if (value && value.link) {
+                        value.link.dataset.downloadBusy = '';
+                        value.link.style.pointerEvents = '';
+                        value.link.style.opacity = '';
+                    }
                 }
+            });
+        }
+
+        function setManagedDownloadLock(lockKey, link, durationMs) {
+            const expiresAt = Date.now() + Math.max(1000, durationMs || 0);
+            managedDownloadLocks.set(lockKey, { expiresAt, link });
+            if (link) {
+                link.dataset.downloadBusy = '1';
+                link.style.pointerEvents = 'none';
+                link.style.opacity = '0.72';
+            }
+        }
+
+        function refreshManagedDownloadLock(lockKey, durationMs) {
+            const current = managedDownloadLocks.get(lockKey);
+            if (!current) {
+                return;
+            }
+            current.expiresAt = Date.now() + Math.max(1000, durationMs || 0);
+            managedDownloadLocks.set(lockKey, current);
+        }
+
+        function releaseManagedDownloadLock(lockKey) {
+            const current = managedDownloadLocks.get(lockKey);
+            if (current && current.link) {
+                current.link.dataset.downloadBusy = '';
+                current.link.style.pointerEvents = '';
+                current.link.style.opacity = '';
+            }
+            managedDownloadLocks.delete(lockKey);
+        }
+
+        function triggerBrowserDownload(href) {
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            iframe.src = href;
+            document.body.appendChild(iframe);
+            setTimeout(() => {
+                try {
+                    iframe.remove();
+                } catch (error) {
+                    console.warn('清理下载 iframe 失败:', error);
+                }
+            }, 60000);
+        }
+
+        function extractDownloadRequestInfo(link) {
+            const href = link.getAttribute('href') || '';
+            if (!href) {
+                return null;
+            }
+
+            const url = new URL(href, window.location.href);
+            const pathname = url.pathname || '';
+            let kind = '';
+            let relativePath = '';
+
+            if (pathname.startsWith('/download_folder/')) {
+                kind = 'folder';
+                relativePath = decodeURIComponent(pathname.substring('/download_folder/'.length));
+            } else if (pathname.startsWith('/download/')) {
+                kind = 'file';
+                relativePath = decodeURIComponent(pathname.substring('/download/'.length));
+            } else {
+                return null;
+            }
+
+            const itemNameEl = link.closest('.file-item')?.querySelector('.file-name-text');
+            const displayName = (itemNameEl && itemNameEl.textContent.trim()) || relativePath || '文件';
+
+            return {
+                href: url.toString(),
+                kind,
+                relativePath,
+                displayName
+            };
+        }
+
+        function getManagedDownloadKey(info) {
+            return `${info.kind}:${info.relativePath}`;
+        }
+
+        async function fetchDownloadHint(info) {
+            try {
+                const response = await fetchWithPresence('/api/download_hint', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        path: info.relativePath,
+                        kind: info.kind
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error((data && data.message) || '获取下载提示失败');
+                }
+                return data;
+            } catch (error) {
+                console.warn('获取下载提示失败，改用本地提示:', error);
+                return null;
+            }
+        }
+
+        function showDownloadWaitNotice(info, hint) {
+            if (currentProgressTaskId !== null) {
+                return;
+            }
+
+            clearDownloadNoticeTimers();
+
+            const baseTitle = info.kind === 'folder' ? '📦 正在准备下载...' : '⬇️ 正在请求下载...';
+            const sizeText = hint && hint.size ? ` 文件大小 ${hint.size}。` : '';
+            const primaryMessage = hint && hint.message
+                ? hint.message
+                : (info.kind === 'folder'
+                    ? '服务器正在打包文件夹，请耐心等待下载开始。'
+                    : '下载请求已发出，如果浏览器没有立刻弹出保存，请稍等几秒。');
+
+            showProgress(baseTitle);
+            updateProgress(12, `已提交“${info.displayName}”的下载请求。${sizeText} ${primaryMessage}`.trim(), null);
+
+            downloadNoticeTimers.push(setTimeout(() => {
+                updateProgress(28, info.kind === 'folder'
+                    ? '正在准备压缩包，文件多时会先等待一段时间，请勿重复点击。'
+                    : '正在等待浏览器接收下载流，大文件或多人同时下载时会更慢一些。', null);
+            }, 1800));
+
+            downloadNoticeTimers.push(setTimeout(() => {
+                if (hint && hint.active_downloads >= 2) {
+                    updateProgress(42, `当前还有 ${hint.active_downloads} 个下载任务在传输，这个请求可能需要继续排队，请勿重复点击。`, null);
+                } else {
+                    updateProgress(42, '如果还没有开始下载，通常是服务器仍在准备或浏览器还在等待响应。', null);
+                }
+            }, 4200));
+
+            downloadNoticeTimers.push(setTimeout(() => {
+                hideProgress();
+                clearDownloadNoticeTimers();
+            }, 12000));
+        }
+
+        async function startManagedDownload(link) {
+            const info = extractDownloadRequestInfo(link);
+            if (!info) {
+                window.location.href = link.href;
+                return;
+            }
+
+            cleanupManagedDownloadLocks();
+            const lockKey = getManagedDownloadKey(info);
+            const existingLock = managedDownloadLocks.get(lockKey);
+            if (existingLock && existingLock.expiresAt > Date.now()) {
+                showProgress(info.kind === 'folder' ? '📦 下载已在准备中...' : '⬇️ 下载请求已发送...');
+                updateProgress(30, `“${info.displayName}”的下载请求已经提交，正在等待服务器处理，请勿重复点击。`, null);
+                setTimeout(() => {
+                    hideProgress();
+                }, 2200);
+                return;
+            }
+
+            const initialLockMs = info.kind === 'folder' ? 18000 : 6000;
+            setManagedDownloadLock(lockKey, link, initialLockMs);
+
+            try {
+                const hint = await fetchDownloadHint(info);
+                showDownloadWaitNotice(info, hint);
+
+                let lockDurationMs = initialLockMs;
+                if (info.kind === 'folder') {
+                    if (hint && hint.task_status === 'preparing') {
+                        lockDurationMs = 25000;
+                    } else if (hint && hint.task_status === 'ready') {
+                        lockDurationMs = 4000;
+                    } else if (hint && hint.busy) {
+                        lockDurationMs = 22000;
+                    }
+                } else if (hint && hint.large_file) {
+                    lockDurationMs = hint.busy ? 10000 : 7000;
+                }
+
+                refreshManagedDownloadLock(lockKey, lockDurationMs);
+                setTimeout(() => {
+                    triggerBrowserDownload(info.href);
+                }, 80);
+                setTimeout(() => {
+                    releaseManagedDownloadLock(lockKey);
+                }, lockDurationMs);
+            } catch (error) {
+                releaseManagedDownloadLock(lockKey);
+                throw error;
+            }
+        }
+
+        document.addEventListener('click', function(event) {
+            const link = event.target.closest('a.btn-download');
+            if (!link) {
+                return;
+            }
+
+            const info = extractDownloadRequestInfo(link);
+            if (!info) {
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            startManagedDownload(link).catch(error => {
+                console.error('处理下载请求失败，改用直接下载:', error);
+                window.location.href = link.href;
             });
         });
         
@@ -9377,7 +10089,20 @@ HTML_TEMPLATE = """
         }
         
         // 更新任务列表
-        function updateTasksList() {
+        function updateTasksList(force = false) {
+            const now = Date.now();
+
+            if (tasksRequestInFlight) {
+                tasksRefreshPending = true;
+                return;
+            }
+
+            if (!force && tasksLastFetchedAt && (now - tasksLastFetchedAt) < tasksRefreshMinIntervalMs) {
+                tasksRefreshPending = true;
+                return;
+            }
+
+            tasksRequestInFlight = true;
             fetch('/api/tasks')
                 .then(response => response.json())
                 .then(data => {
@@ -9389,7 +10114,15 @@ HTML_TEMPLATE = """
                         }
                     }
                 })
-                .catch(error => console.error('获取任务列表失败:', error));
+                .catch(error => console.error('获取任务列表失败:', error))
+                .finally(() => {
+                    tasksRequestInFlight = false;
+                    tasksLastFetchedAt = Date.now();
+                    if (tasksRefreshPending) {
+                        tasksRefreshPending = false;
+                        setTimeout(() => updateTasksList(true), 0);
+                    }
+                });
         }
         
         // 渲染任务列表
@@ -10228,41 +10961,47 @@ HTML_TEMPLATE = """
             downloadFileWithResume(task.filename, taskId);
         }
         
-        // 定期更新任务列表（后台清理已完成的任务）
+        function shouldPollBackgroundTasks() {
+            if (document.hidden) {
+                return false;
+            }
+            if (Object.keys(activeTasks).length > 0 || Object.keys(localRealtimeUploads).length > 0) {
+                return true;
+            }
+            const notification = document.getElementById('incompleteTasksNotification');
+            return !!(notification && notification.style.display !== 'none');
+        }
+
+        // 后台低频清理已完成任务，避免多人在线时高频轮询压垮服务器
         setInterval(function() {
-            // 后台清理，不显示面板
-                    }, 1000);
-        
-        // 后台定期清理已完成的任务（即使面板关闭）
-        setInterval(function() {
-            fetch('/api/tasks')
+            if (!shouldPollBackgroundTasks()) {
+                return;
+            }
+
+            fetch('/api/all_tasks')
                 .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        // 检查所有任务，包括已完成的任务
-                        fetch('/api/all_tasks')
-                            .then(r => r.json())
-                            .then(allData => {
-                                if (allData.success) {
-                                    Object.keys(allData.tasks || {}).forEach(taskId => {
-                                        const task = allData.tasks[taskId];
-                                        if (task.status === 'completed') {
-                                            // 自动删除已完成超过 2 秒的任务
-                                            const completedAt = new Date(task.completed_at);
-                                            const now = new Date();
-                                            if (now - completedAt > 2000) {
-                                                fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
-                                                    .catch(() => {});
-                                            }
-                                        }
-                                    });
-                                }
-                            })
-                            .catch(() => {});
+                .then(allData => {
+                    if (!allData.success) {
+                        return;
                     }
+
+                    Object.entries(allData.tasks || {}).forEach(([taskId, task]) => {
+                        if (task.status !== 'completed' || !task.completed_at) {
+                            return;
+                        }
+
+                        const completedAt = new Date(task.completed_at);
+                        if (Number.isNaN(completedAt.getTime())) {
+                            return;
+                        }
+
+                        if ((Date.now() - completedAt.getTime()) > completedTaskCleanupGraceMs) {
+                            fetch(`/api/tasks/${taskId}`, { method: 'DELETE' }).catch(() => {});
+                        }
+                    });
                 })
                 .catch(() => {});
-        }, 500);
+        }, backgroundTaskCleanupIntervalMs);
         
         // 统一上传表单提交流程，避免浏览器默认行为打断自定义上传
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
@@ -11157,42 +11896,8 @@ def check_updates(subpath=''):
         
         if not os.path.exists(current_path):
             return jsonify({'success': False, 'message': '路径不存在。'}), 404
-        
-        # 获取文件列表信息
-        items = []
-        try:
-            with os.scandir(current_path) as entries:
-                for entry in entries:
-                    item = entry.name
-                    if should_hide_shared_item(item):
-                        continue
-                    if not os.access(entry.path, os.R_OK):
-                        continue
-                    try:
-                        stat = entry.stat(follow_symlinks=False)
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                        items.append({
-                            'name': item,
-                            'is_dir': is_dir,
-                            'mtime': stat.st_mtime,
-                            'size': 0 if is_dir else stat.st_size
-                        })
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        
-        # 计算文件列表哈希，用于检测变化
-        import hashlib
-        items_str = '|'.join(sorted([f"{item['name']}_{item['mtime']}_{item['size']}" for item in items]))
-        hash_value = hashlib.md5(items_str.encode()).hexdigest()
-        
-        return jsonify({
-            'success': True,
-            'hash': hash_value,
-            'count': len(items),
-            'items': items
-        })
+
+        return jsonify(get_directory_updates_payload(current_path))
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -11352,9 +12057,84 @@ def search_files():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/download_hint', methods=['POST'])
+def get_download_hint():
+    """Return lightweight hints for large-file or busy download waits."""
+    try:
+        data = request.get_json(silent=True) or {}
+        relative_path = (data.get('path') or '').strip()
+        kind = str(data.get('kind') or 'file').strip().lower()
+
+        if not relative_path:
+            return jsonify({'success': False, 'message': '缺少下载路径。'}), 400
+
+        success, target_path, error = safe_join_path(app.config['UPLOAD_FOLDER'], relative_path)
+        if not success:
+            return jsonify({'success': False, 'message': error}), 403
+
+        active_downloads = get_active_download_request_count()
+        busy_threshold = max(2, min(6, WAITRESS_THREADS // 4))
+
+        if kind == 'folder':
+            if not os.path.isdir(target_path):
+                return jsonify({'success': False, 'message': '文件夹不存在。'}), 404
+
+            task_key = build_folder_download_task_key(relative_path)
+            task_snapshot = get_prepared_download_task_snapshot(task_key)
+            task_status = task_snapshot.get('status') if task_snapshot else None
+            is_busy = active_downloads >= busy_threshold
+            if task_status == 'preparing':
+                message = '这个文件夹的压缩包已经在准备中，重复点击会复用当前任务，请稍等。'
+            elif task_status == 'ready':
+                message = '这个文件夹的压缩包刚刚准备好，当前请求会直接复用已有结果。'
+            else:
+                message = (
+                    f'当前有 {active_downloads} 个下载任务正在处理，文件夹打包可能需要等待。'
+                    if is_busy else
+                    '文件夹下载需要先在服务器上打包，文件多时会先等待一段时间。'
+                )
+            return jsonify({
+                'success': True,
+                'kind': 'folder',
+                'active_downloads': active_downloads,
+                'busy': is_busy,
+                'task_status': task_status,
+                'message': message
+            })
+
+        if not os.path.isfile(target_path):
+            return jsonify({'success': False, 'message': '文件不存在。'}), 404
+
+        size_bytes = os.path.getsize(target_path)
+        is_large = size_bytes >= DOWNLOAD_WAIT_WARNING_BYTES
+        is_busy = active_downloads >= busy_threshold
+
+        if is_busy and is_large:
+            message = f'当前有 {active_downloads} 个下载任务正在传输，这个大文件可能需要先排队，请勿重复点击。'
+        elif is_busy:
+            message = f'当前有 {active_downloads} 个下载任务正在传输，浏览器可能会先等待几秒再开始下载。'
+        elif is_large:
+            message = f'这个文件较大（{get_file_size(size_bytes)}），浏览器可能会先等待一段时间再开始下载。'
+        else:
+            message = '下载请求已发出，如果浏览器没有立刻弹出保存，请稍等几秒。'
+
+        return jsonify({
+            'success': True,
+            'kind': 'file',
+            'active_downloads': active_downloads,
+            'busy': is_busy,
+            'large_file': is_large,
+            'size_bytes': size_bytes,
+            'size': get_file_size(size_bytes),
+            'message': message
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 @app.route('/download/<path:filename>')
 def download_file(filename):
     """Download a single file with range request support."""
+    download_registered = False
     try:
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
@@ -11395,6 +12175,9 @@ def download_file(filename):
                 mimetype='application/octet-stream',
                 direct_passthrough=True
             )
+            begin_active_download_request()
+            download_registered = True
+            response.call_on_close(finish_active_download_request)
             response.headers.add('Content-Range', f'bytes {byte_start}-{byte_end}/{file_size}')
             response.headers.add('Accept-Ranges', 'bytes')
             response.headers.add('Content-Length', str(byte_end - byte_start + 1))
@@ -11413,6 +12196,9 @@ def download_file(filename):
                 conditional=True,
                 max_age=0
             )
+            begin_active_download_request()
+            download_registered = True
+            response.call_on_close(finish_active_download_request)
             response.headers.add('Accept-Ranges', 'bytes')
             
         add_activity(get_current_username(), 'download', download_name)
@@ -11420,6 +12206,8 @@ def download_file(filename):
         return response
              
     except Exception as e:
+        if download_registered:
+            finish_active_download_request()
         flash(f'下载失败: {str(e)}', 'danger')
         return redirect(url_for('index'))
 
@@ -11467,6 +12255,7 @@ def stream_file(filename):
 @app.route('/download_folder/<path:folder_name>')
 def download_folder(folder_name):
     """下载整个文件夹，打包为 ZIP 并尽量流式压缩。"""
+    download_registered = False
     try:
         success, folder_path, error = safe_join_path(app.config['UPLOAD_FOLDER'], folder_name)
         if not success:
@@ -11476,82 +12265,93 @@ def download_folder(folder_name):
         if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
             flash('文件夹不存在', 'danger')
             return redirect(url_for('index'))
-        
-        file_count = 0
-        total_size = 0
-        for root, dirs, files in os.walk(folder_path):
-            file_count += len(files)
-            for file in files:
-                file_path = os.path.join(root, file)
-                try:
-                    total_size += os.path.getsize(file_path)
-                except:
-                    pass
-        
-        print(f"\n开始打包文件夹: {folder_name}")
-        print(f"   文件数量: {file_count}")
-        print(f"   总大小: {total_size / 1024 / 1024:.2f} MB")
-        
-        # 使用临时文件进行流式压缩（避免内存溢出）
-        import tempfile
-        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-        temp_zip.close()
-        
-        try:
-            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
-                processed = 0
-                no_compress_ext = {'.zip', '.rar', '.7z', '.gz', '.jpg', '.jpeg', '.png', '.gif', 
-                                  '.mp4', '.mp3', '.avi', '.mkv', '.mov', '.flac', '.wav'}
-                
-                for root, dirs, files in os.walk(folder_path):
-                    # 首先添加目录结构（确保空文件夹也被包含）
-                    for dir_name in dirs:
-                        dir_path = os.path.join(root, dir_name)
-                        arcname = os.path.relpath(dir_path, folder_path) + '/'
-                        zipf.writestr(arcname, '')
-                    
-                    # 添加文件
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, folder_path)
-                        
-                        # 对已压缩文件使用ZIP_STORED（不压缩）以加快速度
-                        file_ext = os.path.splitext(file)[1].lower()
-                        if file_ext in no_compress_ext:
-                            zipf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED)
-                        else:
-                            zipf.write(file_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
-                        
-                        processed += 1
-                        if processed % 100 == 0:
-                            print(f"   进度: {processed}/{file_count} ({processed*100//file_count}%)")
-            
-            print(f"打包完成: {folder_name}.zip")
-            
-            # 记录下载活动
-            add_activity(get_current_username(), '下载', f'文件夹 {folder_name}')
-            
-            # 返回文件（优化：固定mimetype，支持条件请求）
-            zip_filename = os.path.basename(folder_name) + '.zip'
-            response = send_file(
-                temp_zip.name,
-                mimetype='application/zip',
-                as_attachment=True,
-                download_name=zip_filename,
-                conditional=True,  # 支持条件请求
-                max_age=0  # 禁用缓存
-            )
-            response.call_on_close(lambda: os.path.exists(temp_zip.name) and os.unlink(temp_zip.name))
-            return response
-        except Exception as e:
-            # 清理临时文件
+
+        task_key = build_folder_download_task_key(folder_name)
+        task_snapshot, is_owner = get_or_create_prepared_download_task(task_key, 'folder', folder_name)
+        begin_active_download_request()
+        download_registered = True
+
+        if is_owner:
+            file_count = 0
+            total_size = 0
+            for root, dirs, files in os.walk(folder_path):
+                file_count += len(files)
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        total_size += os.path.getsize(file_path)
+                    except OSError:
+                        pass
+
+            print(f"\n开始打包文件夹: {folder_name}")
+            print(f"   文件数量: {file_count}")
+            print(f"   总大小: {total_size / 1024 / 1024:.2f} MB")
+
+            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+            temp_zip.close()
+
             try:
-                os.unlink(temp_zip.name)
-            except:
-                pass
-            raise e
+                with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
+                    processed = 0
+                    no_compress_ext = {'.zip', '.rar', '.7z', '.gz', '.jpg', '.jpeg', '.png', '.gif',
+                                      '.mp4', '.mp3', '.avi', '.mkv', '.mov', '.flac', '.wav'}
+
+                    for root, dirs, files in os.walk(folder_path):
+                        for dir_name in dirs:
+                            dir_path = os.path.join(root, dir_name)
+                            arcname = os.path.relpath(dir_path, folder_path) + '/'
+                            zipf.writestr(arcname, '')
+
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, folder_path)
+
+                            file_ext = os.path.splitext(file)[1].lower()
+                            if file_ext in no_compress_ext:
+                                zipf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED)
+                            else:
+                                zipf.write(file_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
+
+                            processed += 1
+                            if file_count and processed % 100 == 0:
+                                print(f"   进度: {processed}/{file_count} ({processed*100//file_count}%)")
+
+                print(f"打包完成: {folder_name}.zip")
+                mark_prepared_download_task_ready(task_key, temp_zip.name)
+                add_activity(get_current_username(), '下载', f'文件夹 {folder_name}')
+            except Exception as e:
+                mark_prepared_download_task_failed(task_key, str(e), temp_path=temp_zip.name)
+                if download_registered:
+                    finish_active_download_request()
+                    download_registered = False
+                raise
+        else:
+            if task_snapshot and task_snapshot.get('status') == 'preparing':
+                print(f"复用正在准备中的文件夹下载任务: {folder_name}")
+                if not wait_for_prepared_download_task(task_key):
+                    if download_registered:
+                        finish_active_download_request()
+                        download_registered = False
+                    flash('文件夹下载准备超时，请重试。', 'danger')
+                    return redirect(url_for('index'))
+            elif task_snapshot and task_snapshot.get('status') == 'ready':
+                print(f"复用已准备好的文件夹下载任务: {folder_name}")
+
+        prepared_task = get_prepared_download_task_snapshot(task_key)
+        if not prepared_task or prepared_task.get('status') != 'ready':
+            if download_registered:
+                finish_active_download_request()
+                download_registered = False
+            error_message = (prepared_task or {}).get('error') or '文件夹下载准备失败，请重试。'
+            flash(error_message, 'danger')
+            return redirect(url_for('index'))
+
+        zip_filename = os.path.basename(folder_name) + '.zip'
+        return build_prepared_download_response(task_key, zip_filename)
             
     except Exception as e:
+        if download_registered:
+            finish_active_download_request()
         print(f"下载文件夹失败: {str(e)}")
         flash(f'下载文件夹失败: {str(e)}', 'danger')
         return redirect(url_for('index'))
@@ -11590,6 +12390,8 @@ def upload_chunk():
     preserve_chunk_files = False
     temp_filepath = None
     effective_filename = ''
+    task_id = None
+    total_chunks = 1
     try:
         task_id = request.form.get('task_id')
         chunk_index = int(request.form.get('chunk_index', 0))
@@ -11600,33 +12402,56 @@ def upload_chunk():
         
         if not task_id or not chunk_data:
             return jsonify({'success': False, 'message': '缺少必要参数'}), 400
+
+        if total_chunks <= 0 or chunk_index < 0 or chunk_index >= total_chunks:
+            return jsonify({'success': False, 'message': '分块参数无效'}), 400
         
         # 安全化文件名
         filename = secure_filename(filename)
         if not filename:
             return jsonify({'success': False, 'message': '文件名无效'}), 400
         
-        with tasks_lock:
-            if task_id not in tasks:
-                username = get_current_username()
-                normalized_upload_path = (upload_path or '').replace('\\', '/').strip('/')
-                
-                tasks[task_id] = {
-                    'type': 'upload',
-                    'status': 'running',
-                    'filename': filename,
-                    'upload_path': normalized_upload_path,
-                    'total_chunks': total_chunks,
-                    'uploaded_chunks': 0,
-                    'created_at': datetime.now().isoformat(),
-                    'ip': request.remote_addr,
-                    'username': username
-                }
-            
-            task = tasks[task_id]
-            effective_filename = task.get('filename') or filename
-            effective_upload_path = (task.get('upload_path') or '').replace('\\', '/').strip('/')
-            total_chunks = int(task.get('total_chunks') or total_chunks)
+        task_lock = get_upload_task_lock(task_id)
+
+        with task_lock:
+            now_iso = datetime.now().isoformat()
+            now_ts = time.time()
+
+            with tasks_lock:
+                if task_id not in tasks:
+                    username = get_current_username()
+                    normalized_upload_path = (upload_path or '').replace('\\', '/').strip('/')
+
+                    tasks[task_id] = {
+                        'type': 'upload',
+                        'status': 'running',
+                        'filename': filename,
+                        'upload_path': normalized_upload_path,
+                        'total_chunks': total_chunks,
+                        'uploaded_chunks': 0,
+                        'progress': 0,
+                        'chunk_count_verified': True,
+                        'last_progress_persisted_at': 0.0,
+                        'created_at': now_iso,
+                        'updated_at': now_iso,
+                        'ip': request.remote_addr,
+                        'username': username
+                    }
+
+                task = tasks[task_id]
+                effective_filename = task.get('filename') or filename
+                effective_upload_path = (task.get('upload_path') or '').replace('\\', '/').strip('/')
+                total_chunks = int(task.get('total_chunks') or total_chunks)
+                task_status = str(task.get('status') or 'running')
+                uploaded_count = int(task.get('uploaded_chunks') or 0)
+                chunk_count_verified = bool(task.get('chunk_count_verified'))
+
+                if task_status == 'paused':
+                    return jsonify({'success': False, 'message': '任务已暂停。', 'paused': True}), 200
+
+                if task_status != 'running':
+                    task['status'] = 'running'
+                    task['updated_at'] = now_iso
 
             if effective_upload_path:
                 success, target_dir, error = safe_join_path(app.config['UPLOAD_FOLDER'], effective_upload_path)
@@ -11637,43 +12462,42 @@ def upload_chunk():
             else:
                 filepath = os.path.join(app.config['UPLOAD_FOLDER'], effective_filename)
 
-            # 使用临时文件夹存储分块文件，避免在上传文件夹中产生小文件
             temp_filepath = os.path.join(TEMP_FOLDER, f'{task_id}_{effective_filename}.tmp')
-            
-            if task['status'] == 'paused':
-                return jsonify({'success': False, 'message': '任务已暂停。', 'paused': True}), 200
-            
-            if task['status'] != 'running':
-                task['status'] = 'running'
-            
-            # 检查分块是否已存在，用于断点续传
             chunk_file = temp_filepath + f'.chunk{chunk_index}'
-            if os.path.exists(chunk_file):
-                # 分块已存在，跳过保存
-                pass
-            else:
-                # 保存分块数据
+
+            if not chunk_count_verified:
+                uploaded_count = count_existing_upload_chunks(temp_filepath, total_chunks)
+                with tasks_lock:
+                    if task_id in tasks:
+                        task = tasks[task_id]
+                        task['uploaded_chunks'] = uploaded_count
+                        task['chunk_count_verified'] = True
+                        task['updated_at'] = now_iso
+                        task['last_progress_persisted_at'] = now_ts
+                        save_tasks()
+
+            chunk_already_exists = os.path.exists(chunk_file)
+            if not chunk_already_exists:
                 chunk_data.save(chunk_file)
-            
-            # 更新已上传的分块数量
-            uploaded_count = sum(1 for i in range(total_chunks) 
-                                if os.path.exists(temp_filepath + f'.chunk{i}'))
-            task['uploaded_chunks'] = uploaded_count
-            
-            if uploaded_count >= total_chunks:
+                uploaded_count = min(total_chunks, uploaded_count + 1)
+
+            completed = uploaded_count >= total_chunks
+            progress = 100.0 if completed else round((uploaded_count / total_chunks) * 100, 1)
+            if progress > 99 and progress < 100:
+                progress = 99.9
+
+            if completed:
                 try:
                     with open(temp_filepath, 'wb') as outfile:
-                        for i in range(total_chunks):
-                            chunk_file = temp_filepath + f'.chunk{i}'
-                            if os.path.exists(chunk_file):
-                                with open(chunk_file, 'rb') as infile:
+                        for index in range(total_chunks):
+                            current_chunk_file = temp_filepath + f'.chunk{index}'
+                            if os.path.exists(current_chunk_file):
+                                with open(current_chunk_file, 'rb') as infile:
                                     shutil.copyfileobj(infile, outfile)
-                    
+
                     if not os.path.exists(temp_filepath):
                         raise Exception('合并后的临时文件不存在。')
-                    
-                    # 原子性地替换目标文件
-                    # 使用临时文件名，然后原子性重命名
+
                     if os.path.exists(filepath):
                         backup_path = filepath + '.backup'
                         try:
@@ -11681,24 +12505,22 @@ def upload_chunk():
                             shutil.move(temp_filepath, filepath)
                             if os.path.exists(backup_path):
                                 os.remove(backup_path)
-                        except Exception as e:
-                            # 恢复备份
+                        except Exception:
                             if os.path.exists(backup_path):
                                 shutil.move(backup_path, filepath)
-                            raise e
+                            raise
                     else:
                         shutil.move(temp_filepath, filepath)
-                    
-                    for i in range(total_chunks):
-                        chunk_file = temp_filepath + f'.chunk{i}'
-                        if os.path.exists(chunk_file):
+
+                    for index in range(total_chunks):
+                        current_chunk_file = temp_filepath + f'.chunk{index}'
+                        if os.path.exists(current_chunk_file):
                             try:
-                                os.remove(chunk_file)
-                            except:
-                                pass  # 忽略清理失败
-                    
+                                os.remove(current_chunk_file)
+                            except OSError:
+                                pass
+
                 except Exception as merge_error:
-                    # 合并失败，保留分块文件供重试
                     preserve_chunk_files = True
                     try:
                         if temp_filepath and os.path.exists(temp_filepath):
@@ -11707,28 +12529,47 @@ def upload_chunk():
                         print(f"[upload-chunk] partial temp cleanup failed: {partial_cleanup_error}")
                     print(f"[upload-chunk] merge failed: {merge_error}")
                     raise merge_error
-                
-                task['status'] = 'completed'
-                task['completed_at'] = datetime.now().isoformat()
-                task['updated_at'] = datetime.now().isoformat()
-                
-                # 记录活动
-                add_activity(get_current_username(), 'upload', filename)
+
+                with tasks_lock:
+                    if task_id in tasks:
+                        task = tasks[task_id]
+                        task['uploaded_chunks'] = total_chunks
+                        task['progress'] = 100
+                        task['status'] = 'completed'
+                        task['completed_at'] = now_iso
+                        task['updated_at'] = now_iso
+                        task['chunk_count_verified'] = True
+                        task['last_progress_persisted_at'] = now_ts
+                        task.pop('error', None)
+                        save_tasks()
+
+                add_activity(get_current_username(), 'upload', effective_filename)
             else:
-                task['progress'] = round((task['uploaded_chunks'] / total_chunks) * 100, 1)
-                # 如果进度大于 99 但小于 100，则显示为 99.9，避免提前显示 100%
-                if task['progress'] > 99 and task['progress'] < 100:
-                    task['progress'] = 99.9
-            
-            save_tasks()
-        
-        return jsonify({
-            'success': True,
-            'progress': task.get('progress', 0),
-            'uploaded_chunks': task['uploaded_chunks'],
-            'total_chunks': total_chunks,
-            'completed': task['status'] == 'completed'
-        })
+                should_persist_progress = False
+                with tasks_lock:
+                    if task_id in tasks:
+                        task = tasks[task_id]
+                        task['uploaded_chunks'] = uploaded_count
+                        task['progress'] = progress
+                        task['updated_at'] = now_iso
+                        task['chunk_count_verified'] = True
+                        task.pop('error', None)
+
+                        last_persisted_at = float(task.get('last_progress_persisted_at') or 0.0)
+                        if uploaded_count <= 1 or (now_ts - last_persisted_at) >= UPLOAD_PROGRESS_PERSIST_INTERVAL_SECONDS:
+                            task['last_progress_persisted_at'] = now_ts
+                            should_persist_progress = True
+
+                        if should_persist_progress:
+                            save_tasks()
+
+            return jsonify({
+                'success': True,
+                'progress': progress,
+                'uploaded_chunks': total_chunks if completed else uploaded_count,
+                'total_chunks': total_chunks,
+                'completed': completed
+            })
         
     except Exception as e:
         print(f"[upload-chunk] failed: {str(e)}")
@@ -11755,45 +12596,14 @@ def upload_chunk():
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     """Docstring."""
-    with tasks_lock:
-        # 只返回当前IP的任务，排除已完成的任务
-        client_id = request.remote_addr
-        user_tasks = {}
-        tasks_to_delete = []
-        
-        for tid, task in tasks.items():
-            if task.get('ip') == client_id and task['status'] != 'completed':
-                # 检查文件是否已上传完成，通过检查目标文件是否存在
-                if task['type'] == 'upload':
-                    filename = task.get('filename', '')
-                    if filename:
-                        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                        if os.path.exists(filepath):
-                            tasks_to_delete.append(tid)
-                            continue
-                
-                user_tasks[tid] = task
-        
-        # 删除已完成的任务
-        for tid in tasks_to_delete:
-            del tasks[tid]
-        
-        if tasks_to_delete:
-            save_tasks()
-        
-        return jsonify({'success': True, 'tasks': user_tasks})
+    client_id = request.remote_addr
+    return jsonify(build_tasks_payload_for_client(client_id, include_completed=False))
 
 @app.route('/api/all_tasks', methods=['GET'])
 def get_all_tasks():
     """获取所有任务列表，包括已完成任务，供清理使用。"""
-    with tasks_lock:
-        # 返回当前IP的所有任务，包括已完成的
-        client_id = request.remote_addr
-        user_tasks = {
-            tid: task for tid, task in tasks.items()
-            if task.get('ip') == client_id
-        }
-        return jsonify({'success': True, 'tasks': user_tasks})
+    client_id = request.remote_addr
+    return jsonify(build_tasks_payload_for_client(client_id, include_completed=True))
 
 @app.route('/api/tasks/<task_id>/pause', methods=['POST'])
 def pause_task(task_id):
@@ -11825,35 +12635,40 @@ def delete_task(task_id):
     print(f"[tasks] delete requested: {task_id}")
     
     deleted_count = 0
-    try:
-        # 遍历临时文件夹，删除所有以 task_id 开头的文件
-        for filename in os.listdir(TEMP_FOLDER):
-            if filename.startswith(task_id + '_'):
-                filepath = os.path.join(TEMP_FOLDER, filename)
-                try:
-                    os.remove(filepath)
-                    deleted_count += 1
-                    print(f"   removed temp file: {filename}")
-                except Exception as e:
-                    print(f"   failed removing temp file {filename}: {e}")
-    except Exception as e:
-        print(f"   failed cleaning temp folder: {e}")
-    
-    print(f"   removed {deleted_count} temp files")
-    
-    with tasks_lock:
-        if task_id in tasks:
-            task = tasks[task_id]
-            print(f"   task info: {task.get('filename')} - status: {task.get('status')}")
-            
-            # 直接删除任务
-            del tasks[task_id]
-            save_tasks()
-            print(f"[tasks] deleted {task_id}")
-            return jsonify({'success': True, 'message': '任务已删除。', 'deleted_files': deleted_count})
-        else:
-            print("[tasks] task missing from registry, temp files already cleaned")
-            return jsonify({'success': True, 'message': '任务已删除。', 'deleted_files': deleted_count})
+    task_lock = get_upload_task_lock(task_id)
+    with task_lock:
+        try:
+            # 遍历临时文件夹，删除所有以 task_id 开头的文件
+            for filename in os.listdir(TEMP_FOLDER):
+                if filename.startswith(task_id + '_'):
+                    filepath = os.path.join(TEMP_FOLDER, filename)
+                    try:
+                        os.remove(filepath)
+                        deleted_count += 1
+                        print(f"   removed temp file: {filename}")
+                    except Exception as e:
+                        print(f"   failed removing temp file {filename}: {e}")
+        except Exception as e:
+            print(f"   failed cleaning temp folder: {e}")
+        
+        print(f"   removed {deleted_count} temp files")
+        
+        with tasks_lock:
+            if task_id in tasks:
+                task = tasks[task_id]
+                print(f"   task info: {task.get('filename')} - status: {task.get('status')}")
+                
+                # 直接删除任务
+                del tasks[task_id]
+                save_tasks()
+                print(f"[tasks] deleted {task_id}")
+                response = jsonify({'success': True, 'message': '任务已删除。', 'deleted_files': deleted_count})
+            else:
+                print("[tasks] task missing from registry, temp files already cleaned")
+                response = jsonify({'success': True, 'message': '任务已删除。', 'deleted_files': deleted_count})
+
+    remove_upload_task_lock(task_id)
+    return response
 
 @app.route('/api/rename', methods=['POST'])
 def rename_item():
@@ -12414,6 +13229,7 @@ def access_share(link_id):
 @app.route('/api/batch_download', methods=['POST'])
 def batch_download():
     """批量下载选中的文件，打包为 ZIP 并尽量流式压缩。"""
+    download_registered = False
     try:
         data = request.get_json(silent=True)
         if isinstance(data, dict):
@@ -12424,73 +13240,102 @@ def batch_download():
         if not paths:
             return jsonify({'success': False, 'message': '请选择要下载的文件。'}), 400
 
-        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-        temp_zip.close()
-        
-        print(f"[batch-download] start: {len(paths)} items")
-        
-        # 使用临时文件流式压缩，避免大批量下载时浏览器拿 blob 占太多内存
-        with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
-            file_count = 0
-            for path in paths:
-                success, full_path, error = safe_join_path(app.config['UPLOAD_FOLDER'], path)
-                if not success:
-                    print(f"[batch-download] skip invalid path: {path}")
-                    continue
-                
-                if not os.path.exists(full_path):
-                    print(f"[batch-download] skip missing path: {path}")
-                    continue
-                
-                # 如果是文件，直接添加
-                if os.path.isfile(full_path):
-                    try:
-                        zipf.write(full_path, arcname=os.path.basename(path))
-                        file_count += 1
-                        print(f"  added file: {os.path.basename(path)}")
-                    except Exception as e:
-                        print(f"  failed adding file: {path}, error: {e}")
-                
-                # 如果是文件夹，则递归添加
-                elif os.path.isdir(full_path):
-                    print(f"  compressing folder: {os.path.basename(path)}")
-                    folder_file_count = 0
-                    for root, dirs, files in os.walk(full_path):
-                        for file in files:
+        normalized_paths = [
+            normalize_download_task_path(path)
+            for path in paths
+            if normalize_download_task_path(path)
+        ]
+        if not normalized_paths:
+            return jsonify({'success': False, 'message': '请选择有效的下载项。'}), 400
+
+        task_key = build_batch_download_task_key(normalized_paths)
+        task_snapshot, is_owner = get_or_create_prepared_download_task(task_key, 'batch', f'{len(normalized_paths)} items')
+        begin_active_download_request()
+        download_registered = True
+
+        if is_owner:
+            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+            temp_zip.close()
+
+            print(f"[batch-download] start: {len(normalized_paths)} items")
+
+            try:
+                with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
+                    file_count = 0
+                    for path in normalized_paths:
+                        success, full_path, error = safe_join_path(app.config['UPLOAD_FOLDER'], path)
+                        if not success:
+                            print(f"[batch-download] skip invalid path: {path}")
+                            continue
+
+                        if not os.path.exists(full_path):
+                            print(f"[batch-download] skip missing path: {path}")
+                            continue
+
+                        if os.path.isfile(full_path):
                             try:
-                                file_path = os.path.join(root, file)
-                                arcname = os.path.join(
-                                    os.path.basename(path),
-                                    os.path.relpath(file_path, full_path)
-                                )
-                                zipf.write(file_path, arcname=arcname)
-                                folder_file_count += 1
+                                zipf.write(full_path, arcname=os.path.basename(path))
                                 file_count += 1
-                                
-                                if folder_file_count % 100 == 0:
-                                    print(f"    compressed {folder_file_count} files...")
+                                print(f"  added file: {os.path.basename(path)}")
                             except Exception as e:
-                                print(f"    skipped file: {file}, error: {e}")
-                    
-                    print(f"  finished folder: {os.path.basename(path)} ({folder_file_count} files)")
-        
-        print(f"[batch-download] completed: {file_count} files")
+                                print(f"  failed adding file: {path}, error: {e}")
 
-        # 返回ZIP文件
+                        elif os.path.isdir(full_path):
+                            print(f"  compressing folder: {os.path.basename(path)}")
+                            folder_file_count = 0
+                            for root, dirs, files in os.walk(full_path):
+                                for file in files:
+                                    try:
+                                        file_path = os.path.join(root, file)
+                                        arcname = os.path.join(
+                                            os.path.basename(path),
+                                            os.path.relpath(file_path, full_path)
+                                        )
+                                        zipf.write(file_path, arcname=arcname)
+                                        folder_file_count += 1
+                                        file_count += 1
+
+                                        if folder_file_count % 100 == 0:
+                                            print(f"    compressed {folder_file_count} files...")
+                                    except Exception as e:
+                                        print(f"    skipped file: {file}, error: {e}")
+
+                            print(f"  finished folder: {os.path.basename(path)} ({folder_file_count} files)")
+
+                print(f"[batch-download] completed: {file_count} files")
+                mark_prepared_download_task_ready(task_key, temp_zip.name)
+                add_activity(get_current_username(), '下载', f'批量下载（{len(normalized_paths)}项）')
+            except Exception as e:
+                mark_prepared_download_task_failed(task_key, str(e), temp_path=temp_zip.name)
+                if download_registered:
+                    finish_active_download_request()
+                    download_registered = False
+                raise
+        else:
+            if task_snapshot and task_snapshot.get('status') == 'preparing':
+                print(f"[batch-download] reuse preparing task: {task_key}")
+                if not wait_for_prepared_download_task(task_key):
+                    if download_registered:
+                        finish_active_download_request()
+                        download_registered = False
+                    return jsonify({'success': False, 'message': '批量下载准备超时，请重试。'}), 504
+            elif task_snapshot and task_snapshot.get('status') == 'ready':
+                print(f"[batch-download] reuse cached task: {task_key}")
+
+        prepared_task = get_prepared_download_task_snapshot(task_key)
+        if not prepared_task or prepared_task.get('status') != 'ready':
+            if download_registered:
+                finish_active_download_request()
+                download_registered = False
+            error_message = (prepared_task or {}).get('error') or '批量下载准备失败，请重试。'
+            return jsonify({'success': False, 'message': error_message}), 500
+
         zip_filename = f'批量下载_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-
-        response = send_file(
-            temp_zip.name,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name=zip_filename,
-            conditional=True,
-            max_age=0
-        )
-        response.call_on_close(lambda: os.path.exists(temp_zip.name) and os.unlink(temp_zip.name))
-        return response
+        return build_prepared_download_response(task_key, zip_filename)
     
     except Exception as e:
+        if download_registered:
+            finish_active_download_request()
         print(f"[batch-download] failed: {str(e)}")
         import traceback
         traceback.print_exc()
